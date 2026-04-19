@@ -71,6 +71,7 @@
 #include <unzipLIB.h>
 #include <WebServer.h>
 #include <WiFi.h>
+#include <Preferences.h>
 #include <new>
 #include <vector>
 
@@ -142,6 +143,14 @@ enum class ReaderFontStyle : uint8_t
 	BoldOblique = 3,
 };
 
+enum class ReaderLineSpacing : uint8_t
+{
+	Compact = 0,
+	Normal = 1,
+	Loose = 2,
+	VeryLoose = 3,
+};
+
 enum class ReaderTextAlign : uint8_t
 {
 	Left = 0,
@@ -184,6 +193,12 @@ File epubFsFile;
 
 ReaderFontFamily readerFontFamily = ReaderFontFamily::SansSerif;
 uint8_t readerFontSizePt = 12;
+ReaderLineSpacing readerLineSpacing = ReaderLineSpacing::Normal;
+Preferences readerSettingsStore;
+constexpr const char* kSettingsNamespace = "reader";
+constexpr const char* kKeyFontFamily = "font_family";
+constexpr const char* kKeyFontSize = "font_size";
+constexpr const char* kKeyLineSpacing = "line_spacing";
 constexpr char kStyleMarker = 0x1D;
 constexpr char kAlignMarker = 0x1E;
 std::vector<String> readerCssAlignCenterClasses;
@@ -251,6 +266,62 @@ uint8_t clampFontSize(uint8_t sizePt)
 		return 18;
 	}
 	return 24;
+}
+
+bool saveReaderSettings()
+{
+	if (!readerSettingsStore.begin(kSettingsNamespace, false))
+	{
+		Serial.println("Failed to open settings storage for write");
+		return false;
+	}
+
+	const bool familyOk = readerSettingsStore.putUChar(kKeyFontFamily, static_cast<uint8_t>(readerFontFamily)) == sizeof(uint8_t);
+	const bool sizeOk = readerSettingsStore.putUChar(kKeyFontSize, readerFontSizePt) == sizeof(uint8_t);
+	const bool spacingOk = readerSettingsStore.putUChar(kKeyLineSpacing, static_cast<uint8_t>(readerLineSpacing)) == sizeof(uint8_t);
+	readerSettingsStore.end();
+
+	if (!familyOk || !sizeOk || !spacingOk)
+	{
+		Serial.println("Failed to persist reader settings");
+		return false;
+	}
+
+	return true;
+}
+
+void loadReaderSettings()
+{
+	if (!readerSettingsStore.begin(kSettingsNamespace, true))
+	{
+		Serial.println("Failed to open settings storage for read");
+		return;
+	}
+
+	const uint8_t storedFamily = readerSettingsStore.getUChar(kKeyFontFamily, static_cast<uint8_t>(ReaderFontFamily::SansSerif));
+	const uint8_t storedSize = readerSettingsStore.getUChar(kKeyFontSize, 12);
+	const uint8_t storedSpacing = readerSettingsStore.getUChar(kKeyLineSpacing, static_cast<uint8_t>(ReaderLineSpacing::Normal));
+	readerSettingsStore.end();
+
+	if (storedFamily <= static_cast<uint8_t>(ReaderFontFamily::Mono))
+	{
+		readerFontFamily = static_cast<ReaderFontFamily>(storedFamily);
+	}
+	else
+	{
+		readerFontFamily = ReaderFontFamily::SansSerif;
+	}
+
+	readerFontSizePt = clampFontSize(storedSize);
+
+	if (storedSpacing <= static_cast<uint8_t>(ReaderLineSpacing::VeryLoose))
+	{
+		readerLineSpacing = static_cast<ReaderLineSpacing>(storedSpacing);
+	}
+	else
+	{
+		readerLineSpacing = ReaderLineSpacing::Normal;
+	}
 }
 
 const GFXfont* fontForSettings(ReaderFontFamily family, uint8_t sizePt, ReaderFontStyle style)
@@ -363,7 +434,23 @@ uint16_t uiLineStep()
 	{
 		step = 12;
 	}
-	return step;
+	switch (readerLineSpacing)
+	{
+		case ReaderLineSpacing::Compact:
+			break;
+		case ReaderLineSpacing::Normal:
+			step = static_cast<uint16_t>((step * 108U + 50U) / 100U);
+			break;
+		case ReaderLineSpacing::Loose:
+			step = static_cast<uint16_t>((step * 120U + 50U) / 100U);
+			break;
+		case ReaderLineSpacing::VeryLoose:
+			step = static_cast<uint16_t>((step * 145U + 50U) / 100U);
+			break;
+		default:
+			break;
+	}
+	return step < 12 ? 12 : step;
 }
 
 String fontFamilyLabel()
@@ -377,6 +464,43 @@ String fontFamilyLabel()
 		return "Serif";
 	}
 	return "Sans serif";
+}
+
+String lineSpacingLabel()
+{
+	switch (readerLineSpacing)
+	{
+		case ReaderLineSpacing::Compact:
+			return "Compact";
+		case ReaderLineSpacing::Normal:
+			return "Normal";
+		case ReaderLineSpacing::Loose:
+			return "Loose";
+		case ReaderLineSpacing::VeryLoose:
+			return "Very loose";
+		default:
+			return "Normal";
+	}
+}
+
+void cycleLineSpacing()
+{
+	if (readerLineSpacing == ReaderLineSpacing::Compact)
+	{
+		readerLineSpacing = ReaderLineSpacing::Normal;
+	}
+	else if (readerLineSpacing == ReaderLineSpacing::Normal)
+	{
+		readerLineSpacing = ReaderLineSpacing::Loose;
+	}
+	else if (readerLineSpacing == ReaderLineSpacing::Loose)
+	{
+		readerLineSpacing = ReaderLineSpacing::VeryLoose;
+	}
+	else
+	{
+		readerLineSpacing = ReaderLineSpacing::Compact;
+	}
 }
 
 bool isStyleCodeChar(char code)
@@ -3705,13 +3829,15 @@ void printSettingsMenuToSerial()
 	Serial.println(fontFamilyLabel());
 	Serial.print("3) Font size: ");
 	Serial.println(readerFontSizePt);
-	Serial.println("4) Set family to Sans serif");
-	Serial.println("5) Set family to Serif");
-	Serial.println("6) Set family to Mono");
-	Serial.println("7) Set size to 9");
-	Serial.println("8) Set size to 12");
-	Serial.println("9) Set size to 18");
-	Serial.println("10) Set size to 24");
+	Serial.print("4) Line spacing: ");
+	Serial.println(lineSpacingLabel());
+	Serial.println("5) Set family to Sans serif");
+	Serial.println("6) Set family to Serif");
+	Serial.println("7) Set family to Mono");
+	Serial.println("8) Set size to 9");
+	Serial.println("9) Set size to 12");
+	Serial.println("10) Set size to 18");
+	Serial.println("11) Set size to 24");
 	Serial.print("> ");
 }
 
@@ -3962,16 +4088,20 @@ void showSettingsMenuOnDisplay()
 		display.print(readerFontSizePt);
 		y += static_cast<int16_t>(uiLineStep());
 		display.setCursor(8, y);
-		display.print("4. Sans serif");
+		display.print("4. Line spacing: ");
+		display.print(lineSpacingLabel());
 		y += static_cast<int16_t>(uiLineStep());
 		display.setCursor(8, y);
-		display.print("5. Serif");
+		display.print("5. Sans serif");
 		y += static_cast<int16_t>(uiLineStep());
 		display.setCursor(8, y);
-		display.print("6. Mono");
+		display.print("6. Serif");
 		y += static_cast<int16_t>(uiLineStep());
 		display.setCursor(8, y);
-		display.print("7/8/9/10 -> 9/12/18/24");
+		display.print("7. Mono");
+		y += static_cast<int16_t>(uiLineStep());
+		display.setCursor(8, y);
+		display.print("8/9/10/11 -> 9/12/18/24");
 	}
 	while (display.nextPage());
 }
@@ -4127,6 +4257,7 @@ void handleSettingsSelection(uint16_t choice)
 		{
 			readerFontFamily = ReaderFontFamily::SansSerif;
 		}
+		saveReaderSettings();
 		showSettingsMenu();
 		return;
 	}
@@ -4137,34 +4268,47 @@ void handleSettingsSelection(uint16_t choice)
 		else if (readerFontSizePt == 12) readerFontSizePt = 18;
 		else if (readerFontSizePt == 18) readerFontSizePt = 24;
 		else readerFontSizePt = 9;
+		saveReaderSettings();
 		showSettingsMenu();
 		return;
 	}
 
 	if (choice == 4)
 	{
-		readerFontFamily = ReaderFontFamily::SansSerif;
+		cycleLineSpacing();
+		saveReaderSettings();
 		showSettingsMenu();
 		return;
 	}
 
 	if (choice == 5)
 	{
-		readerFontFamily = ReaderFontFamily::Serif;
+		readerFontFamily = ReaderFontFamily::SansSerif;
+		saveReaderSettings();
 		showSettingsMenu();
 		return;
 	}
 
 	if (choice == 6)
 	{
-		readerFontFamily = ReaderFontFamily::Mono;
+		readerFontFamily = ReaderFontFamily::Serif;
+		saveReaderSettings();
 		showSettingsMenu();
 		return;
 	}
 
-	if (choice == 7 || choice == 8 || choice == 9 || choice == 10)
+	if (choice == 7)
 	{
-		readerFontSizePt = (choice == 7) ? 9 : (choice == 8) ? 12 : (choice == 9) ? 18 : 24;
+		readerFontFamily = ReaderFontFamily::Mono;
+		saveReaderSettings();
+		showSettingsMenu();
+		return;
+	}
+
+	if (choice == 8 || choice == 9 || choice == 10 || choice == 11)
+	{
+		readerFontSizePt = (choice == 8) ? 9 : (choice == 9) ? 12 : (choice == 10) ? 18 : 24;
+		saveReaderSettings();
 		showSettingsMenu();
 		return;
 	}
@@ -4356,6 +4500,8 @@ void setup()
 	{
 		Serial.println("LittleFS mount failed");
 	}
+
+	loadReaderSettings();
 
 	#if defined(ESP32) && defined(USE_HSPI_FOR_EPD)
 	hspi.begin(13, 12, 14, 15);
