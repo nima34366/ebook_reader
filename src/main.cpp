@@ -453,6 +453,21 @@ uint16_t uiLineStep()
 	return step < 12 ? 12 : step;
 }
 
+int16_t uiScreenHeaderY()
+{
+	return static_cast<int16_t>(readerFontSizePt + 12);
+}
+
+int16_t uiScreenBodyStartY()
+{
+	return static_cast<int16_t>(uiScreenHeaderY() + static_cast<int16_t>(uiLineStep()) + 4);
+}
+
+uint16_t uiReaderBodyStartY()
+{
+	return static_cast<uint16_t>(readerFontSizePt + 16 + uiLineStep());
+}
+
 String fontFamilyLabel()
 {
 	if (readerFontFamily == ReaderFontFamily::Mono)
@@ -801,7 +816,18 @@ bool pushReaderPageLine(const String& encodedLine)
 	}
 	readerParseCurrentPage += encodeAlignedLine(encodedLine, readerParseCurrentAlign);
 	++readerParseLineCount;
-	if (readerParseLineCount >= static_cast<uint16_t>((display.height() - static_cast<uint16_t>(readerFontSizePt + 12)) / uiLineStep()))
+	const int32_t usableHeight = static_cast<int32_t>(display.height()) - static_cast<int32_t>(uiReaderBodyStartY()) - 8;
+	uint16_t maxLinesPerPage = 1;
+	if (usableHeight > 0)
+	{
+		maxLinesPerPage = static_cast<uint16_t>(usableHeight / static_cast<int32_t>(uiLineStep()));
+		if (maxLinesPerPage == 0)
+		{
+			maxLinesPerPage = 1;
+		}
+	}
+
+	if (readerParseLineCount >= maxLinesPerPage)
 	{
 		readerPages.push_back(readerParseCurrentPage);
 		readerParseCurrentPage = "";
@@ -3607,7 +3633,7 @@ void showReaderPageOnDisplay()
 			display.print("+");
 		}
 
-		int16_t y = static_cast<int16_t>(readerFontSizePt + 16);
+		int16_t y = static_cast<int16_t>(uiReaderBodyStartY());
 		const String& pageText = readerPages[readerPageIndex];
 		int start = 0;
 		while (start <= pageText.length())
@@ -3768,6 +3794,11 @@ String buildBookListHtml()
 	}
 	while (file)
 	{
+		if (file.isDirectory())
+		{
+			file = root.openNextFile();
+			continue;
+		}
 		html += "<li><code>";
 		html += htmlEscape(String(file.name()));
 		html += "</code> (";
@@ -3792,6 +3823,11 @@ uint16_t refreshBookList()
 	File file = root.openNextFile();
 	while (file && bookCount < kMaxBooks)
 	{
+		if (file.isDirectory())
+		{
+			file = root.openNextFile();
+			continue;
+		}
 		bookNames[bookCount] = String(file.name());
 		++bookCount;
 		file = root.openNextFile();
@@ -3874,11 +3910,11 @@ void showMainMenuOnDisplay()
 		display.setTextColor(GxEPD_BLACK);
 
 		setDisplayFont(ReaderFontStyle::Bold);
-		display.setCursor(8, static_cast<int16_t>(readerFontSizePt + 12));
+		display.setCursor(8, uiScreenHeaderY());
 		display.print("Ebook Reader Menu");
 
 		setDisplayFont(ReaderFontStyle::Normal);
-		int16_t y = static_cast<int16_t>(readerFontSizePt + 28);
+		int16_t y = uiScreenBodyStartY();
 		const uint16_t maxCharacters = uiCharsPerLine(display.width() - 20);
 		display.setCursor(8, y);
 		display.print("1. Upload books");
@@ -3922,11 +3958,11 @@ void showDeleteMenuOnDisplay()
 		display.fillScreen(GxEPD_WHITE);
 		display.setTextColor(GxEPD_BLACK);
 		setDisplayFont(ReaderFontStyle::Bold);
-		display.setCursor(8, static_cast<int16_t>(readerFontSizePt + 12));
+		display.setCursor(8, uiScreenHeaderY());
 		display.print("Delete books");
 
 		setDisplayFont(ReaderFontStyle::Normal);
-		int16_t y = static_cast<int16_t>(readerFontSizePt + 28);
+		int16_t y = uiScreenBodyStartY();
 		const uint16_t maxCharacters = uiCharsPerLine(display.width() - 20);
 		display.setCursor(8, y);
 		display.print("1. Cancel");
@@ -3964,11 +4000,11 @@ void showStatusOnDisplay(const String& title, const String& line)
 		display.fillScreen(GxEPD_WHITE);
 		display.setTextColor(GxEPD_BLACK);
 		setDisplayFont(ReaderFontStyle::Bold);
-		display.setCursor(8, static_cast<int16_t>(readerFontSizePt + 12));
+		display.setCursor(8, uiScreenHeaderY());
 		display.print(title);
 
 		setDisplayFont(ReaderFontStyle::Normal);
-		display.setCursor(8, static_cast<int16_t>(readerFontSizePt + 28));
+		display.setCursor(8, uiScreenBodyStartY());
 		display.print(truncateForDisplay(line, uiCharsPerLine(display.width() - 20)));
 	}
 	while (display.nextPage());
@@ -3984,13 +4020,13 @@ void showBookSelectedOnDisplay(const String& bookName)
 		display.fillScreen(GxEPD_WHITE);
 		display.setTextColor(GxEPD_BLACK);
 		setDisplayFont(ReaderFontStyle::Bold);
-		display.setCursor(8, static_cast<int16_t>(readerFontSizePt + 12));
+		display.setCursor(8, uiScreenHeaderY());
 		display.print("Selected book");
 
 		setDisplayFont(ReaderFontStyle::Normal);
-		display.setCursor(8, static_cast<int16_t>(readerFontSizePt + 30));
+		display.setCursor(8, uiScreenBodyStartY());
 		display.print(truncateForDisplay(bookName, uiCharsPerLine(display.width() - 20)));
-		display.setCursor(8, static_cast<int16_t>(readerFontSizePt + 30 + uiLineStep()));
+		display.setCursor(8, static_cast<int16_t>(uiScreenBodyStartY() + static_cast<int16_t>(uiLineStep())));
 		display.print("(Reader view next step)");
 	}
 	while (display.nextPage());
@@ -4006,11 +4042,11 @@ void showInvalidOptionOnDisplay()
 		display.fillScreen(GxEPD_WHITE);
 		display.setTextColor(GxEPD_BLACK);
 		setDisplayFont(ReaderFontStyle::Bold);
-		display.setCursor(8, static_cast<int16_t>(readerFontSizePt + 12));
+		display.setCursor(8, uiScreenHeaderY());
 		display.print("Invalid option");
 
 		setDisplayFont(ReaderFontStyle::Normal);
-		display.setCursor(8, static_cast<int16_t>(readerFontSizePt + 28));
+		display.setCursor(8, uiScreenBodyStartY());
 		display.print("Use serial input number.");
 	}
 	while (display.nextPage());
@@ -4027,11 +4063,11 @@ void showUploadPortalOnDisplay(const IPAddress& ipAddress)
 		display.setTextColor(GxEPD_BLACK);
 
 		setDisplayFont(ReaderFontStyle::Bold);
-		display.setCursor(8, static_cast<int16_t>(readerFontSizePt + 12));
+		display.setCursor(8, uiScreenHeaderY());
 		display.print("Wi-Fi upload ready");
 
 		setDisplayFont(ReaderFontStyle::Normal);
-		display.setCursor(8, static_cast<int16_t>(readerFontSizePt + 28));
+		display.setCursor(8, uiScreenBodyStartY());
 		display.print("SSID: ");
 		display.println(kApSsid);
 		display.print("IP: ");
@@ -4048,6 +4084,11 @@ void showUploadPortalOnDisplay(const IPAddress& ipAddress)
 		const uint16_t maxCharacters = uiCharsPerLine(display.width() - 20);
 		while (file && count < 12)
 		{
+			if (file.isDirectory())
+			{
+				file = root.openNextFile();
+				continue;
+			}
 			display.print("- ");
 			display.println(truncateForDisplay(String(file.name()), maxCharacters - 2));
 			++count;
@@ -4071,11 +4112,11 @@ void showSettingsMenuOnDisplay()
 		display.fillScreen(GxEPD_WHITE);
 		display.setTextColor(GxEPD_BLACK);
 		setDisplayFont(ReaderFontStyle::Bold);
-		display.setCursor(8, static_cast<int16_t>(readerFontSizePt + 12));
+		display.setCursor(8, uiScreenHeaderY());
 		display.print("Settings");
 
 		setDisplayFont(ReaderFontStyle::Normal);
-		int16_t y = static_cast<int16_t>(readerFontSizePt + 28);
+		int16_t y = uiScreenBodyStartY();
 		display.setCursor(8, y);
 		display.print("1. Back");
 		y += static_cast<int16_t>(uiLineStep());
