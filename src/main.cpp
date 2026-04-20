@@ -73,6 +73,7 @@
 #include <WiFi.h>
 #include <Preferences.h>
 #include <new>
+#include <cstring>
 #include <vector>
 
 #define USE_HSPI_FOR_EPD
@@ -114,6 +115,7 @@ constexpr uint16_t kMaxBooks = 64;
 constexpr size_t kReaderMaxExtractBytes = 120000;
 constexpr size_t kReaderMaxBookTextChars = 1200000;
 constexpr size_t kReaderMaxCoverBytes = 300000;
+constexpr const char* kReaderCoverTempPath = "/reader_cover.tmp";
 
 WebServer server(kWebPort);
 bool wifiServerRunning = false;
@@ -125,6 +127,8 @@ enum class ReaderSerialMode : uint8_t
 	MainMenu,
 	DeleteMenu,
 	SettingsMenu,
+	ReaderStartMenu,
+	ReaderJumpPageInput,
 	ReaderMenu,
 };
 
@@ -160,6 +164,20 @@ enum class ReaderTextAlign : uint8_t
 
 ReaderSerialMode serialMode = ReaderSerialMode::MainMenu;
 String serialLineBuffer;
+enum class SerialNavInput : uint8_t
+{
+	None,
+	Up,
+	Down,
+	Left,
+	Right,
+};
+
+uint16_t mainMenuCursor = 0;
+uint16_t deleteMenuCursor = 0;
+uint16_t settingsMenuCursor = 0;
+uint16_t readerStartMenuCursor = 0;
+
 String bookNames[kMaxBooks];
 uint16_t bookCount = 0;
 File uploadFile;
@@ -169,6 +187,7 @@ String readerBookTitle;
 std::vector<String> readerPages;
 uint16_t readerPageIndex = 0;
 std::vector<String> readerChapterPaths;
+std::vector<String> readerChapterTitles;
 uint16_t readerChapterIndex = 0;
 String readerCoverPath;
 bool readerHasCover = false;
@@ -196,6 +215,11 @@ uint8_t readerFontSizePt = 12;
 ReaderLineSpacing readerLineSpacing = ReaderLineSpacing::Normal;
 Preferences readerSettingsStore;
 constexpr const char* kSettingsNamespace = "reader";
+constexpr const char* kIndexCacheNamespace = "reader_idx";
+constexpr uint8_t kIndexCacheSlots = 6;
+constexpr const char* kBookmarksNamespace = "reader_bm";
+constexpr size_t kBookmarkPathBytes = 96;
+constexpr uint32_t kBookmarkPersistIntervalMs = 5000;
 constexpr const char* kKeyFontFamily = "font_family";
 constexpr const char* kKeyFontSize = "font_size";
 constexpr const char* kKeyLineSpacing = "line_spacing";
@@ -203,6 +227,32 @@ constexpr char kStyleMarker = 0x1D;
 constexpr char kAlignMarker = 0x1E;
 std::vector<String> readerCssAlignCenterClasses;
 std::vector<String> readerCssAlignRightClasses;
+
+struct ReaderBookmark
+{
+	String bookPath;
+	uint16_t chapterIndex = 0;
+	uint16_t pageIndex = 0;
+	bool showingCover = false;
+};
+
+struct ReaderNavEntry
+{
+	String href;
+	String title;
+};
+
+ReaderBookmark readerBookmarks[kMaxBooks];
+uint16_t readerBookmarkCount = 0;
+bool readerBookmarksDirty = false;
+uint32_t readerBookmarksLastPersistMs = 0;
+uint16_t readerResumeChapterIndex = 0;
+uint16_t readerResumePageIndex = 0;
+bool readerResumeShowingCover = false;
+uint16_t readerCoverReturnPageIndex = 0;
+uint16_t readerJumpTargetChapterIndex = 0;
+uint16_t readerChapterPageCounts[kMaxBooks] = {0};
+uint32_t readerTotalPagesLoaded = 0;
 
 struct ReaderMarkupStreamState
 {
@@ -240,6 +290,280 @@ struct ReaderCoverDrawContext
 	PNG* pngDecoder = nullptr;
 	uint16_t* pngLineBuffer = nullptr;
 	size_t pngLineCapacity = 0;
+};
+
+static void* openLittleFSFileForPng(const char* filename, int32_t* fileSize)
+{
+	File* file = new (std::nothrow) File(LittleFS.open(filename, FILE_READ));
+	if (!file || !(*file))
+	{
+		delete file;
+		return nullptr;
+	}
+
+	if (fileSize)
+	{
+		*fileSize = static_cast<int32_t>(file->size());
+	}
+	return file;
+}
+
+static void closeLittleFSFileForPng(void* handle)
+{
+	if (!handle)
+	{
+		return;
+	}
+
+	File* file = reinterpret_cast<File*>(handle);
+	file->close();
+	delete file;
+}
+
+static int32_t readLittleFSFileForPng(PNGFILE* pFile, uint8_t* buffer, int32_t length)
+{
+	if (!pFile || !pFile->fHandle)
+	{
+		return -1;
+	}
+
+	File* file = reinterpret_cast<File*>(pFile->fHandle);
+	return static_cast<int32_t>(file->read(buffer, static_cast<size_t>(length)));
+}
+
+static int32_t seekLittleFSFileForPng(PNGFILE* pFile, int32_t position)
+{
+	if (!pFile || !pFile->fHandle)
+	{
+		return -1;
+	}
+
+	File* file = reinterpret_cast<File*>(pFile->fHandle);
+	if (!file->seek(static_cast<uint32_t>(position), SeekSet))
+	{
+		return -1;
+	}
+
+	return position;
+}
+
+static void* openLittleFSFileForJpeg(const char* filename, int32_t* fileSize)
+{
+	File* file = new (std::nothrow) File(LittleFS.open(filename, FILE_READ));
+	if (!file || !(*file))
+	{
+		delete file;
+		return nullptr;
+	}
+
+	if (fileSize)
+	{
+		*fileSize = static_cast<int32_t>(file->size());
+	}
+	return file;
+}
+
+static void closeLittleFSFileForJpeg(void* handle)
+{
+	if (!handle)
+	{
+		return;
+	}
+
+	File* file = reinterpret_cast<File*>(handle);
+	file->close();
+	delete file;
+}
+
+static int32_t readLittleFSFileForJpeg(JPEGFILE* pFile, uint8_t* buffer, int32_t length)
+{
+	if (!pFile || !pFile->fHandle)
+	{
+		return 0;
+	}
+
+	File* file = reinterpret_cast<File*>(pFile->fHandle);
+	return static_cast<int32_t>(file->read(buffer, static_cast<size_t>(length)));
+}
+
+static int32_t seekLittleFSFileForJpeg(JPEGFILE* pFile, int32_t position)
+{
+	if (!pFile || !pFile->fHandle)
+	{
+		return -1;
+	}
+
+	File* file = reinterpret_cast<File*>(pFile->fHandle);
+	if (!file->seek(static_cast<uint32_t>(position), SeekSet))
+	{
+		return -1;
+	}
+
+	return position;
+}
+
+bool extractNamedZipEntryToFile(UNZIP& zip, const char* entryName, const char* outputPath, size_t maxBytes = kReaderMaxCoverBytes)
+{
+	if (!entryName || !outputPath)
+	{
+		return false;
+	}
+
+	bool located = (zip.locateFile(entryName) == UNZ_OK);
+	size_t expectedSize = 0;
+	if (located)
+	{
+		unz_file_info fileInfo;
+		char fileName[UNZ_MAXFILENAMEINZIP];
+		if (zip.getFileInfo(&fileInfo, fileName, sizeof(fileName), nullptr, 0, nullptr, 0) == UNZ_OK)
+		{
+			expectedSize = static_cast<size_t>(fileInfo.uncompressed_size);
+		}
+	}
+
+	if (!located)
+	{
+		String alternate = String(entryName);
+		if (alternate.startsWith("/"))
+		{
+			alternate = alternate.substring(1);
+		}
+		else
+		{
+			alternate = "/" + alternate;
+		}
+
+		located = (zip.locateFile(alternate.c_str()) == UNZ_OK);
+		if (located)
+		{
+			unz_file_info fileInfo;
+			char fileName[UNZ_MAXFILENAMEINZIP];
+			if (zip.getFileInfo(&fileInfo, fileName, sizeof(fileName), nullptr, 0, nullptr, 0) == UNZ_OK)
+			{
+				expectedSize = static_cast<size_t>(fileInfo.uncompressed_size);
+			}
+		}
+	}
+
+	if (!located)
+	{
+		String wantedName = String(entryName);
+		const int wantedSlash = wantedName.lastIndexOf('/');
+		String wantedBase = wantedSlash >= 0 ? wantedName.substring(wantedSlash + 1) : wantedName;
+		wantedBase.toLowerCase();
+
+		if (zip.gotoFirstFile() == UNZ_OK)
+		{
+			int rc = UNZ_OK;
+			while (rc == UNZ_OK)
+			{
+				char fileName[UNZ_MAXFILENAMEINZIP];
+				unz_file_info fileInfo;
+				rc = zip.getFileInfo(&fileInfo, fileName, sizeof(fileName), nullptr, 0, nullptr, 0);
+				if (rc == UNZ_OK)
+				{
+					String candidate = String(fileName);
+					String candidateLower = candidate;
+					candidateLower.toLowerCase();
+
+					if (candidate == String(entryName))
+					{
+						located = true;
+						expectedSize = static_cast<size_t>(fileInfo.uncompressed_size);
+						break;
+					}
+
+					const int slash = candidateLower.lastIndexOf('/');
+					const String candidateBase = slash >= 0 ? candidateLower.substring(slash + 1) : candidateLower;
+					if (candidateBase == wantedBase)
+					{
+						located = true;
+						expectedSize = static_cast<size_t>(fileInfo.uncompressed_size);
+						break;
+					}
+				}
+
+				rc = zip.gotoNextFile();
+				yield();
+			}
+		}
+	}
+
+	if (!located)
+	{
+		Serial.print("[COVER] locateFile failed for: ");
+		Serial.println(entryName);
+		return false;
+	}
+
+	if (expectedSize > maxBytes)
+	{
+		Serial.println("[COVER] cover exceeds configured max size");
+		return false;
+	}
+
+	LittleFS.remove(outputPath);
+	File outputFile = LittleFS.open(outputPath, FILE_WRITE);
+	if (!outputFile)
+	{
+		Serial.print("[COVER] failed to open temp file: ");
+		Serial.println(outputPath);
+		return false;
+	}
+
+	if (zip.openCurrentFile() != UNZ_OK)
+	{
+		Serial.println("[COVER] openCurrentFile failed");
+		outputFile.close();
+		LittleFS.remove(outputPath);
+		return false;
+	}
+
+	uint8_t chunk[512];
+	int32_t bytesRead = 0;
+	size_t totalRead = 0;
+	while ((bytesRead = zip.readCurrentFile(chunk, sizeof(chunk))) > 0)
+	{
+		const size_t wanted = static_cast<size_t>(bytesRead);
+		if (totalRead + wanted > maxBytes)
+		{
+			Serial.println("[COVER] cover exceeds max buffer size");
+			zip.closeCurrentFile();
+			outputFile.close();
+			LittleFS.remove(outputPath);
+			return false;
+		}
+
+		const size_t written = outputFile.write(chunk, wanted);
+		if (written != wanted)
+		{
+			Serial.println("[COVER] temp file write failed");
+			zip.closeCurrentFile();
+			outputFile.close();
+			LittleFS.remove(outputPath);
+			return false;
+		}
+
+		totalRead += wanted;
+		if ((totalRead & 0x0FFF) == 0)
+		{
+			yield();
+		}
+	}
+
+	zip.closeCurrentFile();
+	outputFile.flush();
+	outputFile.close();
+	return bytesRead >= 0;
+}
+
+struct ReaderBookmarkStorageRecord
+{
+	char path[kBookmarkPathBytes];
+	uint16_t chapterIndex;
+	uint16_t pageIndex;
+	uint8_t showingCover;
+	uint8_t reserved;
 };
 
 bool isSupportedFontSize(uint8_t sizePt)
@@ -288,6 +612,158 @@ bool saveReaderSettings()
 	}
 
 	return true;
+}
+
+bool flushReaderBookmarksToStorage(bool forceWrite)
+{
+	if (!forceWrite)
+	{
+		if (!readerBookmarksDirty)
+		{
+			return true;
+		}
+
+		const uint32_t now = millis();
+		if (readerBookmarksLastPersistMs != 0 && (now - readerBookmarksLastPersistMs) < kBookmarkPersistIntervalMs)
+		{
+			return true;
+		}
+	}
+
+	Preferences bookmarksStore;
+	if (!bookmarksStore.begin(kBookmarksNamespace, false))
+	{
+		Serial.println("Failed to open bookmark storage for write");
+		return false;
+	}
+
+	const uint16_t count = readerBookmarkCount <= kMaxBooks ? readerBookmarkCount : kMaxBooks;
+	const size_t bytes = static_cast<size_t>(count) * sizeof(ReaderBookmarkStorageRecord);
+	ReaderBookmarkStorageRecord* records = nullptr;
+	if (bytes > 0)
+	{
+		records = static_cast<ReaderBookmarkStorageRecord*>(malloc(bytes));
+		if (!records)
+		{
+			bookmarksStore.end();
+			Serial.println("Failed to allocate bookmark storage buffer");
+			return false;
+		}
+
+		for (uint16_t i = 0; i < count; ++i)
+		{
+			ReaderBookmarkStorageRecord& rec = records[i];
+			memset(&rec, 0, sizeof(rec));
+			const String& path = readerBookmarks[i].bookPath;
+			if (!path.isEmpty())
+			{
+				strncpy(rec.path, path.c_str(), kBookmarkPathBytes - 1);
+				rec.path[kBookmarkPathBytes - 1] = '\0';
+			}
+			rec.chapterIndex = readerBookmarks[i].chapterIndex;
+			rec.pageIndex = readerBookmarks[i].pageIndex;
+			rec.showingCover = readerBookmarks[i].showingCover ? 1 : 0;
+		}
+	}
+
+	const bool countOk = bookmarksStore.putUShort("count", count) == sizeof(uint16_t);
+	bool dataOk = true;
+	if (bytes > 0)
+	{
+		dataOk = bookmarksStore.putBytes("data", records, bytes) == bytes;
+	}
+	else
+	{
+		bookmarksStore.remove("data");
+	}
+
+	bookmarksStore.end();
+	if (records)
+	{
+		free(records);
+	}
+
+	if (countOk && dataOk)
+	{
+		readerBookmarksDirty = false;
+		readerBookmarksLastPersistMs = millis();
+		return true;
+	}
+
+	Serial.println("Failed to persist bookmarks");
+	return false;
+}
+
+void loadReaderBookmarks()
+{
+	readerBookmarkCount = 0;
+	readerBookmarksDirty = false;
+
+	Preferences bookmarksStore;
+	if (!bookmarksStore.begin(kBookmarksNamespace, true))
+	{
+		Serial.println("Failed to open bookmark storage for read");
+		return;
+	}
+
+	uint16_t storedCount = bookmarksStore.getUShort("count", 0);
+	if (storedCount > kMaxBooks)
+	{
+		storedCount = kMaxBooks;
+	}
+
+	const size_t storedBytes = bookmarksStore.getBytesLength("data");
+	const size_t recSize = sizeof(ReaderBookmarkStorageRecord);
+	if (storedCount == 0 || storedBytes < recSize)
+	{
+		bookmarksStore.end();
+		return;
+	}
+
+	size_t maxRecordsByBytes = storedBytes / recSize;
+	if (maxRecordsByBytes > kMaxBooks)
+	{
+		maxRecordsByBytes = kMaxBooks;
+	}
+	if (storedCount > maxRecordsByBytes)
+	{
+		storedCount = static_cast<uint16_t>(maxRecordsByBytes);
+	}
+
+	const size_t bytesToRead = static_cast<size_t>(storedCount) * recSize;
+	ReaderBookmarkStorageRecord* records = static_cast<ReaderBookmarkStorageRecord*>(malloc(bytesToRead));
+	if (!records)
+	{
+		bookmarksStore.end();
+		Serial.println("Failed to allocate bookmark read buffer");
+		return;
+	}
+
+	const size_t bytesRead = bookmarksStore.getBytes("data", records, bytesToRead);
+	bookmarksStore.end();
+	if (bytesRead != bytesToRead)
+	{
+		free(records);
+		Serial.println("Failed to read persisted bookmarks");
+		return;
+	}
+
+	for (uint16_t i = 0; i < storedCount && readerBookmarkCount < kMaxBooks; ++i)
+	{
+		const ReaderBookmarkStorageRecord& rec = records[i];
+		if (rec.path[0] == '\0')
+		{
+			continue;
+		}
+
+		ReaderBookmark& bm = readerBookmarks[readerBookmarkCount++];
+		bm.bookPath = String(rec.path);
+		bm.chapterIndex = rec.chapterIndex;
+		bm.pageIndex = rec.pageIndex;
+		bm.showingCover = rec.showingCover != 0;
+	}
+
+	free(records);
 }
 
 void loadReaderSettings()
@@ -768,6 +1244,299 @@ void normalizeSmartPunctuationAscii(String& text)
 String encodeStyledLine(const String& text, ReaderFontStyle style);
 ReaderTextAlign resolveTagAlignment(const String& attrs, bool& hasAlignment);
 bool appendNextReaderPage();
+String stripZipPathSuffix(const String& path);
+void goToReaderPage(int32_t pageIndex);
+void showStatusOnDisplay(const String& title, const String& line);
+void showMainMenu();
+void showInvalidOptionOnDisplay();
+uint32_t computeReaderIndexSignature(const String& normalizedPath, const std::vector<String>& chapterPaths);
+bool tryLoadReaderIndexCache(uint32_t signature, uint16_t chapterCount);
+void saveReaderIndexCache(uint32_t signature, uint16_t chapterCount, uint32_t totalPages);
+
+uint16_t mainMenuOptionCount()
+{
+	return static_cast<uint16_t>(3 + bookCount);
+}
+
+uint16_t deleteMenuOptionCount()
+{
+	return static_cast<uint16_t>(1 + bookCount);
+}
+
+uint16_t settingsMenuOptionCount()
+{
+	return 11;
+}
+
+uint16_t readerStartMenuOptionCount()
+{
+	return static_cast<uint16_t>(3 + readerChapterPaths.size());
+}
+
+void clampMenuCursor(uint16_t& cursor, uint16_t optionCount)
+{
+	if (optionCount == 0)
+	{
+		cursor = 0;
+		return;
+	}
+	if (cursor >= optionCount)
+	{
+		cursor = static_cast<uint16_t>(optionCount - 1);
+	}
+}
+
+void moveMenuCursor(uint16_t& cursor, uint16_t optionCount, int8_t delta)
+{
+	if (optionCount == 0)
+	{
+		cursor = 0;
+		return;
+	}
+	int32_t next = static_cast<int32_t>(cursor) + delta;
+	if (next < 0)
+	{
+		next = static_cast<int32_t>(optionCount) - 1;
+	}
+	else if (next >= static_cast<int32_t>(optionCount))
+	{
+		next = 0;
+	}
+	cursor = static_cast<uint16_t>(next);
+}
+
+SerialNavInput parseSerialNavInput(String input)
+{
+	input.trim();
+	input.toLowerCase();
+
+	if (input == "up" || input == "u")
+	{
+		return SerialNavInput::Up;
+	}
+	if (input == "down" || input == "d")
+	{
+		return SerialNavInput::Down;
+	}
+	if (input == "left" || input == "l" || input == "back")
+	{
+		return SerialNavInput::Left;
+	}
+	if (input == "right" || input == "r" || input == "select" || input == "ok")
+	{
+		return SerialNavInput::Right;
+	}
+
+	return SerialNavInput::None;
+}
+
+void drawMenuCursorTriangle(int16_t baselineY)
+{
+	const int16_t tipX = 14;
+	const int16_t centerY = static_cast<int16_t>(baselineY - 5);
+	const int16_t halfHeight = 4;
+	display.fillTriangle(tipX, centerY, static_cast<int16_t>(tipX - 8), static_cast<int16_t>(centerY - halfHeight), static_cast<int16_t>(tipX - 8), static_cast<int16_t>(centerY + halfHeight), GxEPD_BLACK);
+}
+
+void printSerialMenuLine(bool selected, const String& text)
+{
+	Serial.print(selected ? "> " : "  ");
+	Serial.println(text);
+}
+
+uint32_t fnv1aUpdate(uint32_t hash, const uint8_t* data, size_t len)
+{
+	for (size_t i = 0; i < len; ++i)
+	{
+		hash ^= data[i];
+		hash *= 16777619UL;
+	}
+	return hash;
+}
+
+uint32_t fnv1aUpdateString(uint32_t hash, const String& value)
+{
+	return fnv1aUpdate(hash, reinterpret_cast<const uint8_t*>(value.c_str()), value.length());
+}
+
+uint32_t computeReaderIndexSignature(const String& normalizedPath, const std::vector<String>& chapterPaths)
+{
+	uint32_t hash = 2166136261UL;
+	hash = fnv1aUpdateString(hash, normalizedPath);
+
+	File f = LittleFS.open(normalizedPath, "r");
+	const uint32_t size = f ? static_cast<uint32_t>(f.size()) : 0;
+	if (f)
+	{
+		f.close();
+	}
+	hash = fnv1aUpdate(hash, reinterpret_cast<const uint8_t*>(&size), sizeof(size));
+
+	const uint8_t family = static_cast<uint8_t>(readerFontFamily);
+	hash = fnv1aUpdate(hash, &family, sizeof(family));
+	hash = fnv1aUpdate(hash, &readerFontSizePt, sizeof(readerFontSizePt));
+	const uint8_t spacing = static_cast<uint8_t>(readerLineSpacing);
+	hash = fnv1aUpdate(hash, &spacing, sizeof(spacing));
+
+	const uint16_t chapterCount = static_cast<uint16_t>(chapterPaths.size());
+	hash = fnv1aUpdate(hash, reinterpret_cast<const uint8_t*>(&chapterCount), sizeof(chapterCount));
+	for (const String& chapterPath : chapterPaths)
+	{
+		hash = fnv1aUpdateString(hash, chapterPath);
+	}
+
+	return hash;
+}
+
+void makeIndexCacheKey(char* outKey, size_t outKeySize, char prefix, uint8_t slot)
+{
+	if (!outKey || outKeySize == 0)
+	{
+		return;
+	}
+	snprintf(outKey, outKeySize, "%c%u", prefix, slot);
+}
+
+bool tryLoadReaderIndexCache(uint32_t signature, uint16_t chapterCount)
+{
+	if (chapterCount == 0 || chapterCount > kMaxBooks)
+	{
+		return false;
+	}
+
+	Preferences cache;
+	if (!cache.begin(kIndexCacheNamespace, true))
+	{
+		return false;
+	}
+
+	const size_t bytesExpected = static_cast<size_t>(chapterCount) * sizeof(uint16_t);
+	for (uint8_t slot = 0; slot < kIndexCacheSlots; ++slot)
+	{
+		char keySig[4];
+		char keyCount[4];
+		char keyTotal[4];
+		char keyCounts[4];
+		char keyUse[4];
+		makeIndexCacheKey(keySig, sizeof(keySig), 's', slot);
+		makeIndexCacheKey(keyCount, sizeof(keyCount), 'c', slot);
+		makeIndexCacheKey(keyTotal, sizeof(keyTotal), 't', slot);
+		makeIndexCacheKey(keyCounts, sizeof(keyCounts), 'b', slot);
+		makeIndexCacheKey(keyUse, sizeof(keyUse), 'u', slot);
+
+		const uint32_t storedSig = cache.getULong(keySig, 0);
+		const uint8_t storedCount = cache.getUChar(keyCount, 0);
+		if (storedSig != signature || storedCount != chapterCount)
+		{
+			continue;
+		}
+
+		const size_t storedBytes = cache.getBytesLength(keyCounts);
+		if (storedBytes != bytesExpected)
+		{
+			continue;
+		}
+
+		for (uint16_t i = 0; i < kMaxBooks; ++i)
+		{
+			readerChapterPageCounts[i] = 0;
+		}
+
+		if (cache.getBytes(keyCounts, readerChapterPageCounts, bytesExpected) != bytesExpected)
+		{
+			continue;
+		}
+
+		readerTotalPagesLoaded = cache.getULong(keyTotal, 0);
+		const uint32_t seq = cache.getULong("seq", 0);
+		cache.putULong(keyUse, seq + 1);
+		cache.putULong("seq", seq + 1);
+		cache.end();
+		return readerTotalPagesLoaded > 0;
+	}
+
+	cache.end();
+	return false;
+}
+
+void saveReaderIndexCache(uint32_t signature, uint16_t chapterCount, uint32_t totalPages)
+{
+	if (chapterCount == 0 || chapterCount > kMaxBooks)
+	{
+		return;
+	}
+
+	Preferences cache;
+	if (!cache.begin(kIndexCacheNamespace, false))
+	{
+		return;
+	}
+
+	int8_t targetSlot = -1;
+	uint32_t oldestUse = 0xFFFFFFFFUL;
+	for (uint8_t slot = 0; slot < kIndexCacheSlots; ++slot)
+	{
+		char keySig[4];
+		char keyCount[4];
+		char keyUse[4];
+		makeIndexCacheKey(keySig, sizeof(keySig), 's', slot);
+		makeIndexCacheKey(keyCount, sizeof(keyCount), 'c', slot);
+		makeIndexCacheKey(keyUse, sizeof(keyUse), 'u', slot);
+
+		const uint32_t storedSig = cache.getULong(keySig, 0);
+		const uint8_t storedCount = cache.getUChar(keyCount, 0);
+		if (storedSig == signature && storedCount == chapterCount)
+		{
+			targetSlot = static_cast<int8_t>(slot);
+			break;
+		}
+
+		if (storedSig == 0 || storedCount == 0)
+		{
+			targetSlot = static_cast<int8_t>(slot);
+			oldestUse = 0;
+			continue;
+		}
+
+		if (targetSlot >= 0 && oldestUse == 0)
+		{
+			continue;
+		}
+
+		const uint32_t use = cache.getULong(keyUse, 0);
+		if (targetSlot < 0 || use < oldestUse)
+		{
+			targetSlot = static_cast<int8_t>(slot);
+			oldestUse = use;
+		}
+	}
+
+	if (targetSlot < 0)
+	{
+		targetSlot = 0;
+	}
+
+	char keySig[4];
+	char keyCount[4];
+	char keyTotal[4];
+	char keyCounts[4];
+	char keyUse[4];
+	makeIndexCacheKey(keySig, sizeof(keySig), 's', static_cast<uint8_t>(targetSlot));
+	makeIndexCacheKey(keyCount, sizeof(keyCount), 'c', static_cast<uint8_t>(targetSlot));
+	makeIndexCacheKey(keyTotal, sizeof(keyTotal), 't', static_cast<uint8_t>(targetSlot));
+	makeIndexCacheKey(keyCounts, sizeof(keyCounts), 'b', static_cast<uint8_t>(targetSlot));
+	makeIndexCacheKey(keyUse, sizeof(keyUse), 'u', static_cast<uint8_t>(targetSlot));
+
+	const uint32_t seq = cache.getULong("seq", 0) + 1;
+	cache.putULong(keySig, signature);
+	cache.putUChar(keyCount, static_cast<uint8_t>(chapterCount));
+	cache.putULong(keyTotal, totalPages);
+	cache.putULong(keyUse, seq);
+	cache.putULong("seq", seq);
+	const size_t bytes = static_cast<size_t>(chapterCount) * sizeof(uint16_t);
+	cache.putBytes(keyCounts, readerChapterPageCounts, bytes);
+	cache.end();
+}
 
 void resetReaderMarkupStreamState()
 {
@@ -1582,6 +2351,128 @@ String truncateForDisplay(const String& text, size_t maxCharacters)
 		return text.substring(0, maxCharacters);
 	}
 	return text.substring(0, maxCharacters - 3) + "...";
+}
+
+int16_t findReaderBookmarkIndex(const String& normalizedBookPath)
+{
+	for (uint16_t i = 0; i < readerBookmarkCount; ++i)
+	{
+		if (readerBookmarks[i].bookPath == normalizedBookPath)
+		{
+			return static_cast<int16_t>(i);
+		}
+	}
+	return -1;
+}
+
+void saveReaderBookmark(const String& normalizedBookPath, uint16_t chapterIndex, uint16_t pageIndex, bool showingCover)
+{
+	if (normalizedBookPath.isEmpty())
+	{
+		return;
+	}
+
+	const int16_t existingIndex = findReaderBookmarkIndex(normalizedBookPath);
+	if (existingIndex >= 0)
+	{
+		ReaderBookmark& bookmark = readerBookmarks[existingIndex];
+		bookmark.chapterIndex = chapterIndex;
+		bookmark.pageIndex = pageIndex;
+		bookmark.showingCover = showingCover;
+		readerBookmarksDirty = true;
+		return;
+	}
+
+	if (readerBookmarkCount < kMaxBooks)
+	{
+		ReaderBookmark& bookmark = readerBookmarks[readerBookmarkCount++];
+		bookmark.bookPath = normalizedBookPath;
+		bookmark.chapterIndex = chapterIndex;
+		bookmark.pageIndex = pageIndex;
+		bookmark.showingCover = showingCover;
+		readerBookmarksDirty = true;
+		return;
+	}
+
+	for (uint16_t i = 1; i < kMaxBooks; ++i)
+	{
+		readerBookmarks[i - 1] = readerBookmarks[i];
+	}
+	ReaderBookmark& tail = readerBookmarks[kMaxBooks - 1];
+	tail.bookPath = normalizedBookPath;
+	tail.chapterIndex = chapterIndex;
+	tail.pageIndex = pageIndex;
+	tail.showingCover = showingCover;
+	readerBookmarksDirty = true;
+}
+
+bool loadReaderBookmark(const String& normalizedBookPath, uint16_t& chapterIndex, uint16_t& pageIndex, bool& showingCover)
+{
+	const int16_t index = findReaderBookmarkIndex(normalizedBookPath);
+	if (index < 0)
+	{
+		return false;
+	}
+
+	const ReaderBookmark& bookmark = readerBookmarks[index];
+	chapterIndex = bookmark.chapterIndex;
+	pageIndex = bookmark.pageIndex;
+	showingCover = bookmark.showingCover;
+	return true;
+}
+
+String chapterLabelForDisplay(uint16_t chapterIndex)
+{
+	if (chapterIndex < readerChapterTitles.size() && !readerChapterTitles[chapterIndex].isEmpty())
+	{
+		return readerChapterTitles[chapterIndex];
+	}
+
+	if (chapterIndex >= readerChapterPaths.size())
+	{
+		return "Untitled chapter";
+	}
+
+	String path = stripZipPathSuffix(readerChapterPaths[chapterIndex]);
+	const int slash = path.lastIndexOf('/');
+	if (slash >= 0)
+	{
+		path = path.substring(slash + 1);
+	}
+	if (path.isEmpty())
+	{
+		return "Untitled chapter";
+	}
+
+	const int dot = path.lastIndexOf('.');
+	if (dot > 0)
+	{
+		path = path.substring(0, dot);
+	}
+	path.replace('_', ' ');
+	path.trim();
+	if (path.isEmpty())
+	{
+		return "Untitled chapter";
+	}
+	return path;
+}
+
+uint32_t globalPageForPosition(uint16_t chapterIndex, uint16_t pageIndex, bool showingCover)
+{
+	if (showingCover && readerHasCover)
+	{
+		return 0;
+	}
+
+	uint32_t page = 0;
+	for (uint16_t i = 0; i < chapterIndex && i < kMaxBooks; ++i)
+	{
+		page += readerChapterPageCounts[i];
+	}
+
+	page += static_cast<uint32_t>(pageIndex) + 1U;
+	return page;
 }
 
 String normalizeZipPath(const String& path);
@@ -2556,6 +3447,140 @@ void collectNavHrefsRecursive(const tinyxml2::XMLElement* element, bool activeTo
 	}
 }
 
+String collectElementText(const tinyxml2::XMLElement* element)
+{
+	if (!element)
+	{
+		return "";
+	}
+
+	String text;
+	for (const tinyxml2::XMLNode* node = element->FirstChild(); node; node = node->NextSibling())
+	{
+		if (const tinyxml2::XMLText* t = node->ToText())
+		{
+			text += t->Value();
+		}
+		else if (const tinyxml2::XMLElement* childEl = node->ToElement())
+		{
+			text += collectElementText(childEl);
+		}
+	}
+
+	text.replace("\r", " ");
+	text.replace("\n", " ");
+	while (text.indexOf("  ") >= 0)
+	{
+		text.replace("  ", " ");
+	}
+	text.trim();
+	return text;
+}
+
+void collectNavEntriesRecursive(const tinyxml2::XMLElement* element, bool activeTocNav, std::vector<ReaderNavEntry>& entries)
+{
+	for (const tinyxml2::XMLElement* current = element; current; current = current->NextSiblingElement())
+	{
+		bool childActive = activeTocNav;
+		const char* name = current->Name();
+		if (name && strcmp(name, "nav") == 0)
+		{
+			const char* id = current->Attribute("id");
+			const char* role = current->Attribute("role");
+			const char* type = current->Attribute("epub:type");
+			if ((id && String(id).indexOf("toc") >= 0) || stringHasToken(role, "doc-toc") || stringHasToken(type, "toc"))
+			{
+				childActive = true;
+			}
+		}
+
+		if (childActive && name && strcmp(name, "a") == 0)
+		{
+			const char* href = current->Attribute("href");
+			if (href && href[0] != '\0')
+			{
+				ReaderNavEntry entry;
+				entry.href = String(href);
+				entry.title = collectElementText(current);
+				entries.push_back(entry);
+			}
+		}
+
+		if (const tinyxml2::XMLElement* child = current->FirstChildElement())
+		{
+			collectNavEntriesRecursive(child, childActive, entries);
+		}
+	}
+}
+
+std::vector<ReaderNavEntry> parseOpfNavEntries(const String& navText)
+{
+	tinyxml2::XMLDocument document;
+	if (document.Parse(navText.c_str()) != tinyxml2::XML_SUCCESS)
+	{
+		return {};
+	}
+
+	std::vector<ReaderNavEntry> entries;
+	collectNavEntriesRecursive(document.RootElement(), false, entries);
+	return entries;
+}
+
+void collectNcxEntriesRecursive(const tinyxml2::XMLElement* element, std::vector<ReaderNavEntry>& entries)
+{
+	for (const tinyxml2::XMLElement* current = element; current; current = current->NextSiblingElement())
+	{
+		const char* name = current->Name();
+		if (name && strcmp(name, "navPoint") == 0)
+		{
+			ReaderNavEntry entry;
+			const tinyxml2::XMLElement* navLabel = current->FirstChildElement("navLabel");
+			if (navLabel)
+			{
+				const tinyxml2::XMLElement* textEl = navLabel->FirstChildElement("text");
+				if (textEl && textEl->GetText())
+				{
+					entry.title = String(textEl->GetText());
+					entry.title.trim();
+				}
+			}
+
+			const tinyxml2::XMLElement* content = current->FirstChildElement("content");
+			if (content)
+			{
+				const char* src = content->Attribute("src");
+				if (src && src[0] != '\0')
+				{
+					entry.href = String(src);
+				}
+			}
+
+			if (!entry.href.isEmpty())
+			{
+				entries.push_back(entry);
+			}
+		}
+
+		if (const tinyxml2::XMLElement* child = current->FirstChildElement())
+		{
+			collectNcxEntriesRecursive(child, entries);
+		}
+	}
+}
+
+std::vector<ReaderNavEntry> parseNcxEntries(const String& ncxText)
+{
+	tinyxml2::XMLDocument document;
+	if (document.Parse(ncxText.c_str()) != tinyxml2::XML_SUCCESS)
+	{
+		return {};
+	}
+
+	std::vector<ReaderNavEntry> entries;
+	collectNcxEntriesRecursive(document.RootElement(), entries);
+	return entries;
+}
+
 std::vector<String> parseOpfNavHrefs(const String& navText)
 {
 	tinyxml2::XMLDocument document;
@@ -2597,6 +3622,59 @@ String parseOpfNavDocumentHref(const String& opfText)
 		if (href && ((properties && stringHasToken(properties, "nav")) || (id && String(id).indexOf("nav") >= 0) || String(href).endsWith("nav.xhtml") || String(href).endsWith("nav.html")))
 		{
 			return String(href);
+		}
+	}
+
+	return "";
+}
+
+String parseOpfNcxDocumentHref(const String& opfText)
+{
+	tinyxml2::XMLDocument document;
+	if (document.Parse(opfText.c_str()) != tinyxml2::XML_SUCCESS)
+	{
+		return "";
+	}
+
+	const tinyxml2::XMLElement* package = document.FirstChildElement("package");
+	if (!package)
+	{
+		return "";
+	}
+
+	String spineTocId;
+	const tinyxml2::XMLElement* spine = package->FirstChildElement("spine");
+	if (spine)
+	{
+		const char* tocId = spine->Attribute("toc");
+		if (tocId && tocId[0] != '\0')
+		{
+			spineTocId = String(tocId);
+		}
+	}
+
+	const tinyxml2::XMLElement* manifest = package->FirstChildElement("manifest");
+	if (!manifest)
+	{
+		return "";
+	}
+
+	for (const tinyxml2::XMLElement* item = manifest->FirstChildElement("item"); item; item = item->NextSiblingElement("item"))
+	{
+		const char* href = item->Attribute("href");
+		if (!href)
+		{
+			continue;
+		}
+
+		const char* mediaType = item->Attribute("media-type");
+		const char* id = item->Attribute("id");
+		const String hrefValue = String(href);
+		if ((!spineTocId.isEmpty() && id && spineTocId == id) ||
+			(mediaType && String(mediaType) == "application/x-dtbncx+xml") ||
+			hrefValue.endsWith(".ncx"))
+		{
+			return hrefValue;
 		}
 	}
 
@@ -2871,15 +3949,40 @@ bool collectEpubTextFromPath(const String& epubPath, String& bookTitle, String& 
 }
 
 void closeReaderChapterStream();
+bool countReaderChapterPages(uint16_t chapterIndex, uint16_t& outPageCount);
+bool buildReaderBookPageIndex();
+
+void saveCurrentReaderProgress()
+{
+	if (readerBookPath.isEmpty())
+	{
+		return;
+	}
+
+	saveReaderBookmark(readerBookPath, readerChapterIndex, readerPageIndex, readerShowingCover);
+	readerResumeChapterIndex = readerChapterIndex;
+	readerResumePageIndex = readerPageIndex;
+	readerResumeShowingCover = readerShowingCover;
+}
 
 void clearReaderState()
 {
+	saveCurrentReaderProgress();
+	flushReaderBookmarksToStorage(true);
 	readerBookPath = "";
 	readerBookTitle = "";
 	resetReaderPageBuilderState();
 	resetReaderMarkupStreamState();
 	readerChapterPaths.clear();
+	readerChapterTitles.clear();
 	readerChapterIndex = 0;
+	readerResumeChapterIndex = 0;
+	readerResumePageIndex = 0;
+	readerResumeShowingCover = false;
+	readerCoverReturnPageIndex = 0;
+	readerJumpTargetChapterIndex = 0;
+	readerTotalPagesLoaded = 0;
+	for (uint16_t i = 0; i < kMaxBooks; ++i) { readerChapterPageCounts[i] = 0; }
 	readerCoverPath = "";
 	readerHasCover = false;
 	readerShowingCover = false;
@@ -2940,9 +4043,10 @@ void closeReaderChapterStream()
 void buildReaderPagesFromText(const String& text);
 bool ensureReaderPageBuilt(int32_t pageIndex);
 
-bool collectEpubChapterPaths(const String& epubPath, String& bookTitle, std::vector<String>& chapterPaths)
+bool collectEpubChapterPaths(const String& epubPath, String& bookTitle, std::vector<String>& chapterPaths, std::vector<String>& chapterTitles)
 {
 	chapterPaths.clear();
+	chapterTitles.clear();
 	readerCssAlignCenterClasses.clear();
 	readerCssAlignRightClasses.clear();
 	epubZip = new (std::nothrow) UNZIP();
@@ -3021,12 +4125,14 @@ bool collectEpubChapterPaths(const String& epubPath, String& bookTitle, std::vec
 
 	std::vector<String> chapterRelativePaths = parseOpfSpineChapters(opfText);
 	const String navDocHref = parseOpfNavDocumentHref(opfText);
+	std::vector<ReaderNavEntry> navEntries;
 	if (navDocHref.length() > 0)
 	{
 		String navDocText;
 		const String navDocPath = resolveRelativePath(rootfilePath, navDocHref);
 		if (readNamedZipEntryToString(*epubZip, navDocPath.c_str(), navDocText))
 		{
+			navEntries = parseOpfNavEntries(navDocText);
 			const std::vector<String> navChapterPaths = parseOpfNavHrefs(navDocText);
 			if (!navChapterPaths.empty())
 			{
@@ -3045,17 +4151,172 @@ bool collectEpubChapterPaths(const String& epubPath, String& bookTitle, std::vec
 		}
 	}
 
-	for (const String& relativePath : chapterRelativePaths)
+	if (navEntries.empty())
 	{
-		const String resolvedPath = resolveRelativePath(rootfilePath, relativePath);
+		const String ncxHref = parseOpfNcxDocumentHref(opfText);
+		if (!ncxHref.isEmpty())
+		{
+			String ncxText;
+			const String ncxPath = resolveRelativePath(rootfilePath, ncxHref);
+			if (readNamedZipEntryToString(*epubZip, ncxPath.c_str(), ncxText, 200000))
+			{
+				navEntries = parseNcxEntries(ncxText);
+			}
+		}
+	}
+
+	std::vector<String> mergedRelativePaths;
+	std::vector<String> mergedRelativeTitles;
+	auto appendMerged = [&](const String& relPath, const String& title)
+	{
+		for (size_t i = 0; i < mergedRelativePaths.size(); ++i)
+		{
+			if (mergedRelativePaths[i] == relPath)
+			{
+				if (mergedRelativeTitles[i].isEmpty() && !title.isEmpty())
+				{
+					mergedRelativeTitles[i] = title;
+				}
+				return;
+			}
+		}
+		mergedRelativePaths.push_back(relPath);
+		mergedRelativeTitles.push_back(title);
+	};
+
+	for (const ReaderNavEntry& entry : navEntries)
+	{
+		appendMerged(entry.href, entry.title);
+	}
+	for (const String& relPath : chapterRelativePaths)
+	{
+		appendMerged(relPath, "");
+	}
+
+	auto appendResolved = [&](const String& resolvedPath, const String& title)
+	{
+		for (size_t i = 0; i < chapterPaths.size(); ++i)
+		{
+			if (chapterPaths[i] == resolvedPath)
+			{
+				if (chapterTitles[i].isEmpty() && !title.isEmpty())
+				{
+					chapterTitles[i] = title;
+				}
+				return;
+			}
+		}
+		chapterPaths.push_back(resolvedPath);
+		chapterTitles.push_back(title);
+	};
+
+	for (size_t i = 0; i < mergedRelativePaths.size(); ++i)
+	{
+		const String resolvedPath = resolveRelativePath(rootfilePath, mergedRelativePaths[i]);
 		if (resolvedPath.length() > 0)
 		{
-			appendUniquePath(chapterPaths, resolvedPath);
+			appendResolved(resolvedPath, mergedRelativeTitles[i]);
 		}
 	}
 
 	cleanupZip();
 	return !chapterPaths.empty();
+}
+
+bool countReaderChapterPages(uint16_t chapterIndex, uint16_t& outPageCount)
+{
+	outPageCount = 0;
+	if (chapterIndex >= readerChapterPaths.size())
+	{
+		return false;
+	}
+
+	closeReaderChapterStream();
+	resetReaderPageBuilderState();
+	resetReaderMarkupStreamState();
+	readerChapterInputEnded = false;
+	readerChapterFileOpen = false;
+
+	epubZip = new (std::nothrow) UNZIP();
+	if (!epubZip)
+	{
+		return false;
+	}
+
+	if (epubZip->openZIP(readerBookPath.c_str(), epubOpenCallback, epubCloseCallback, epubReadCallback, epubSeekCallback) != 0)
+	{
+		delete epubZip;
+		epubZip = nullptr;
+		return false;
+	}
+
+	if (!openNamedZipEntryForStreaming(*epubZip, readerChapterPaths[chapterIndex].c_str()))
+	{
+		closeReaderChapterStream();
+		return false;
+	}
+	readerChapterFileOpen = true;
+
+	while (!readerChapterParseComplete)
+	{
+		if (appendNextReaderPage())
+		{
+			if (!readerPages.empty())
+			{
+				outPageCount = static_cast<uint16_t>(outPageCount + readerPages.size());
+				readerPages.clear();
+			}
+		}
+	}
+
+	if (!readerPages.empty())
+	{
+		outPageCount = static_cast<uint16_t>(outPageCount + readerPages.size());
+		readerPages.clear();
+	}
+
+	if (outPageCount == 0)
+	{
+		outPageCount = 1;
+	}
+
+	closeReaderChapterStream();
+	resetReaderPageBuilderState();
+	resetReaderMarkupStreamState();
+	return true;
+}
+
+bool buildReaderBookPageIndex()
+{
+	readerTotalPagesLoaded = 0;
+	for (uint16_t i = 0; i < kMaxBooks; ++i)
+	{
+		readerChapterPageCounts[i] = 0;
+	}
+
+	showStatusOnDisplay("Indexing book", "Please wait...");
+	Serial.println("Indexing full book pages...");
+
+	for (uint16_t i = 0; i < readerChapterPaths.size() && i < kMaxBooks; ++i)
+	{
+		uint16_t chapterPages = 0;
+		if (!countReaderChapterPages(i, chapterPages))
+		{
+			return false;
+		}
+		readerChapterPageCounts[i] = chapterPages;
+		readerTotalPagesLoaded += chapterPages;
+		if ((i & 0x03) == 0)
+		{
+			yield();
+		}
+		yield();
+	}
+
+	Serial.print("Index complete. Total pages: ");
+	Serial.println(readerTotalPagesLoaded);
+
+	return true;
 }
 
 uint8_t pickCoverScaleDiv(int srcW, int srcH, int maxW, int maxH)
@@ -3212,9 +4473,9 @@ int drawReaderCoverPngLine(PNGDRAW* pDraw)
 	return 1;
 }
 
-bool drawCoverImageOnDisplay(const uint8_t* imageData, size_t imageDataSize, const String& coverPath)
+bool drawCoverImageOnDisplay(const char* imagePath, const String& coverPath)
 {
-	if (!imageData || imageDataSize == 0)
+	if (!imagePath || *imagePath == '\0')
 	{
 		return false;
 	}
@@ -3238,9 +4499,9 @@ bool drawCoverImageOnDisplay(const uint8_t* imageData, size_t imageDataSize, con
 			return false;
 		}
 
-		if (!jpeg->openRAM(const_cast<uint8_t*>(imageData), static_cast<int>(imageDataSize), drawReaderCoverJpegBlock))
+		if (!jpeg->open(imagePath, openLittleFSFileForJpeg, closeLittleFSFileForJpeg, readLittleFSFileForJpeg, seekLittleFSFileForJpeg, drawReaderCoverJpegBlock))
 		{
-			Serial.println("[COVER] JPEG openRAM failed");
+			Serial.println("[COVER] JPEG open failed");
 			delete jpeg;
 			return false;
 		}
@@ -3290,7 +4551,7 @@ bool drawCoverImageOnDisplay(const uint8_t* imageData, size_t imageDataSize, con
 
 	ReaderCoverDrawContext context;
 	context.pngDecoder = png;
-	if (png->openRAM(const_cast<uint8_t*>(imageData), static_cast<int>(imageDataSize), drawReaderCoverPngLine) != PNG_SUCCESS)
+	if (png->open(imagePath, openLittleFSFileForPng, closeLittleFSFileForPng, readLittleFSFileForPng, seekLittleFSFileForPng, drawReaderCoverPngLine) != PNG_SUCCESS)
 	{
 		Serial.print("[COVER] PNG openRAM failed err=");
 		Serial.println(png->getLastError());
@@ -3337,31 +4598,30 @@ void showReaderCoverOnDisplay()
 	display.setRotation(1);
 	display.setFullWindow();
 
-	uint8_t* coverData = nullptr;
-	size_t coverDataSize = 0;
 	bool coverDecoded = false;
-	if (readerHasCover)
+	if (readerHasCover && !readerCoverPath.isEmpty())
 	{
 		Serial.print("[COVER] attempting path: ");
 		Serial.println(readerCoverPath);
 		UNZIP* coverZip = new (std::nothrow) UNZIP();
 		if (coverZip && coverZip->openZIP(readerBookPath.c_str(), epubOpenCallback, epubCloseCallback, epubReadCallback, epubSeekCallback) == 0)
 		{
-			if (readNamedZipEntryToBytes(*coverZip, readerCoverPath.c_str(), coverData, coverDataSize))
+			if (extractNamedZipEntryToFile(*coverZip, readerCoverPath.c_str(), kReaderCoverTempPath))
 			{
-				Serial.print("[COVER] bytes read: ");
-				Serial.println(static_cast<uint32_t>(coverDataSize));
+				Serial.print("[COVER] extracted to temp file: ");
+				Serial.println(kReaderCoverTempPath);
 				display.firstPage();
 				do
 				{
 					display.fillScreen(GxEPD_WHITE);
-					coverDecoded = drawCoverImageOnDisplay(coverData, coverDataSize, readerCoverPath);
+					coverDecoded = drawCoverImageOnDisplay(kReaderCoverTempPath, readerCoverPath);
 				}
 				while (display.nextPage());
+				LittleFS.remove(kReaderCoverTempPath);
 			}
 			else
 			{
-				Serial.println("[COVER] zip read failed for path");
+				Serial.println("[COVER] zip extract failed for path");
 			}
 			coverZip->closeZIP();
 		}
@@ -3374,18 +4634,18 @@ void showReaderCoverOnDisplay()
 		{
 			delete coverZip;
 		}
-
-		if (coverData)
-		{
-			free(coverData);
-			coverData = nullptr;
-			coverDataSize = 0;
-		}
+		LittleFS.remove(kReaderCoverTempPath);
 	}
 
 	if (!coverDecoded)
 	{
-		Serial.println("[COVER] fallback placeholder");
+		Serial.print("[COVER] showing placeholder (hasCover=");
+		Serial.print(readerHasCover);
+		Serial.print(", pathEmpty=");
+		Serial.print(readerCoverPath.isEmpty());
+		Serial.println(")");
+		display.setRotation(1);
+		display.setFullWindow();
 		display.firstPage();
 		do
 		{
@@ -3474,6 +4734,11 @@ bool loadReaderChapter(uint16_t chapterIndex)
 	}
 	readerChapterIndex = chapterIndex;
 	readerPageIndex = 0;
+
+	if (chapterIndex < kMaxBooks)
+	{
+		readerChapterPageCounts[chapterIndex] = readerPages.size();
+	}
 	return true;
 }
 
@@ -3580,10 +4845,11 @@ bool openBookReader(const String& bookPath)
 	const String normalizedPath = bookPath.startsWith("/") ? bookPath : "/" + bookPath;
 	String bookTitle = normalizedPath;
 	std::vector<String> chapterPaths;
+	std::vector<String> chapterTitles;
 	readerCoverPath = "";
 	readerHasCover = false;
 	readerShowingCover = false;
-	if (!collectEpubChapterPaths(normalizedPath, bookTitle, chapterPaths))
+	if (!collectEpubChapterPaths(normalizedPath, bookTitle, chapterPaths, chapterTitles))
 	{
 		return false;
 	}
@@ -3591,13 +4857,43 @@ bool openBookReader(const String& bookPath)
 	readerBookPath = normalizedPath;
 	readerBookTitle = bookTitle;
 	readerChapterPaths = chapterPaths;
-	readerChapterIndex = 0;
-	if (!loadReaderChapter(0))
+	readerChapterTitles = chapterTitles;
+	const uint32_t indexSignature = computeReaderIndexSignature(normalizedPath, chapterPaths);
+	if (!tryLoadReaderIndexCache(indexSignature, static_cast<uint16_t>(chapterPaths.size())))
 	{
-		return false;
+		if (!buildReaderBookPageIndex())
+		{
+			return false;
+		}
+		saveReaderIndexCache(indexSignature, static_cast<uint16_t>(chapterPaths.size()), readerTotalPagesLoaded);
+		Serial.println("Reader index: rebuilt and cached");
 	}
-	readerShowingCover = readerHasCover;
-	serialMode = ReaderSerialMode::ReaderMenu;
+	else
+	{
+		Serial.println("Reader index: loaded from cache");
+	}
+	readerChapterIndex = 0;
+	readerPageIndex = 0;
+	readerResumeChapterIndex = 0;
+	readerResumePageIndex = 0;
+	readerResumeShowingCover = readerHasCover;
+	readerCoverReturnPageIndex = 0;
+
+	uint16_t savedChapter = 0;
+	uint16_t savedPage = 0;
+	bool savedCover = false;
+	if (loadReaderBookmark(normalizedPath, savedChapter, savedPage, savedCover))
+	{
+		if (savedChapter < readerChapterPaths.size())
+		{
+			readerResumeChapterIndex = savedChapter;
+			readerResumePageIndex = savedPage;
+		}
+		readerResumeShowingCover = savedCover && readerHasCover;
+	}
+
+	readerJumpTargetChapterIndex = readerResumeChapterIndex;
+	serialMode = ReaderSerialMode::ReaderStartMenu;
 	return true;
 }
 
@@ -3623,15 +4919,15 @@ void showReaderPageOnDisplay()
 
 		setDisplayFont(ReaderFontStyle::Normal);
 		display.setCursor(display.width() - 64, static_cast<int16_t>(readerFontSizePt + 6));
-		const uint16_t totalPages = static_cast<uint16_t>(readerPages.size() + (readerHasCover ? 1 : 0));
-		const uint16_t shownPage = static_cast<uint16_t>(readerPageIndex + (readerHasCover ? 2 : 1));
-		display.print(shownPage);
-		display.print("/");
-		display.print(totalPages);
-		if (!readerChapterParseComplete)
+		uint32_t globalPageNumber = 0;
+		for (uint16_t i = 0; i < readerChapterIndex; ++i)
 		{
-			display.print("+");
+			globalPageNumber += readerChapterPageCounts[i];
 		}
+		globalPageNumber += readerPageIndex + 1;
+		display.print(globalPageNumber);
+		display.print("/");
+		display.print(readerTotalPagesLoaded);
 
 		int16_t y = static_cast<int16_t>(uiReaderBodyStartY());
 		const String& pageText = readerPages[readerPageIndex];
@@ -3684,22 +4980,27 @@ void printReaderHelpToSerial()
 {
 	Serial.println();
 	Serial.println("===== Reader =====");
-	Serial.println("1) Next page");
-	Serial.println("2) Previous page");
-	Serial.println("3) Back to main screen");
+	Serial.println("down -> Next page");
+	Serial.println("up -> Previous page");
+	Serial.println("left -> Cover/Main menu");
+	uint32_t globalPageNumber = 0;
+	for (uint16_t i = 0; i < readerChapterIndex; ++i)
+	{
+		globalPageNumber += readerChapterPageCounts[i];
+	}
 	if (readerShowingCover)
 	{
 		Serial.println("Page Cover");
 	}
 	else
 	{
-		const uint16_t totalPages = static_cast<uint16_t>(readerPages.size() + (readerHasCover ? 1 : 0));
-		const uint16_t shownPage = static_cast<uint16_t>(readerPageIndex + (readerHasCover ? 2 : 1));
+		globalPageNumber += readerPageIndex + 1;
 		Serial.print("Page ");
-		Serial.print(shownPage);
+		Serial.print(globalPageNumber);
 		Serial.print("/");
-		Serial.println(totalPages);
+		Serial.println(readerTotalPagesLoaded);
 	}
+
 	if (!readerChapterParseComplete)
 	{
 		Serial.println("(more pages in this chapter load on demand)");
@@ -3708,7 +5009,300 @@ void printReaderHelpToSerial()
 	Serial.print(readerChapterIndex + 1);
 	Serial.print("/");
 	Serial.println(readerChapterPaths.size());
+	Serial.println("Controls: up/down page, left back");
 	Serial.print("> ");
+}
+
+bool openReaderAtPosition(uint16_t chapterIndex, uint16_t pageIndex, bool showCover)
+{
+	if (chapterIndex >= readerChapterPaths.size())
+	{
+		chapterIndex = 0;
+		pageIndex = 0;
+		showCover = readerHasCover;
+	}
+
+	if (!loadReaderChapter(chapterIndex))
+	{
+		return false;
+	}
+
+	Serial.print("[OPEN] Cover: hasCover=");
+	Serial.print(readerHasCover);
+	Serial.print(" path='");
+	Serial.print(readerCoverPath);
+	Serial.print("' showCover=");
+	Serial.println(showCover);
+
+	readerShowingCover = showCover && readerHasCover;
+	readerCoverReturnPageIndex = pageIndex;
+	serialMode = ReaderSerialMode::ReaderMenu;
+	if (readerShowingCover)
+	{
+		Serial.println("[OPEN] Showing cover");
+		showReaderCoverOnDisplay();
+		saveCurrentReaderProgress();
+		printReaderHelpToSerial();
+	}
+	else
+	{
+		goToReaderPage(static_cast<int32_t>(pageIndex));
+	}
+	return true;
+}
+
+void showReaderStartMenuOnDisplay()
+{
+	clampMenuCursor(readerStartMenuCursor, readerStartMenuOptionCount());
+
+	display.setRotation(1);
+	display.setFullWindow();
+	display.firstPage();
+	do
+	{
+		display.fillScreen(GxEPD_WHITE);
+		display.setTextColor(GxEPD_BLACK);
+
+		setDisplayFont(ReaderFontStyle::Bold);
+		display.setCursor(8, uiScreenHeaderY());
+		display.print("Book menu");
+
+		setDisplayFont(ReaderFontStyle::Normal);
+		int16_t y = uiScreenBodyStartY();
+		const uint16_t maxChars = uiCharsPerLine(display.width() - 32);
+		uint16_t optionIndex = 0;
+
+		String resumeLine;
+		if (readerResumeShowingCover)
+		{
+			resumeLine = "Resume: Cover";
+		}
+		else
+		{
+			const uint32_t resumeGlobal = globalPageForPosition(readerResumeChapterIndex, readerResumePageIndex, false);
+			resumeLine = "Resume: page " + String(resumeGlobal) + "/" + String(readerTotalPagesLoaded);
+		}
+		if (optionIndex == readerStartMenuCursor)
+		{
+			drawMenuCursorTriangle(y);
+		}
+		display.setCursor(20, y);
+		display.print(truncateForDisplay(resumeLine, maxChars));
+		y += static_cast<int16_t>(uiLineStep());
+		++optionIndex;
+
+		if (optionIndex == readerStartMenuCursor)
+		{
+			drawMenuCursorTriangle(y);
+		}
+		display.setCursor(20, y);
+		display.print("Jump to page");
+		y += static_cast<int16_t>(uiLineStep());
+		++optionIndex;
+
+		if (optionIndex == readerStartMenuCursor)
+		{
+			drawMenuCursorTriangle(y);
+		}
+		display.setCursor(20, y);
+		display.print("Back");
+		y += static_cast<int16_t>(uiLineStep());
+		++optionIndex;
+
+		for (uint16_t i = 0; i < readerChapterPaths.size(); ++i)
+		{
+			if (y > display.height() - 8)
+			{
+				break;
+			}
+			if (optionIndex == readerStartMenuCursor)
+			{
+				drawMenuCursorTriangle(y);
+			}
+			String line = chapterLabelForDisplay(i);
+			display.setCursor(20, y);
+			display.print(truncateForDisplay(line, maxChars));
+			y += static_cast<int16_t>(uiLineStep());
+			++optionIndex;
+		}
+	}
+	while (display.nextPage());
+}
+
+void printReaderStartMenuToSerial()
+{
+	clampMenuCursor(readerStartMenuCursor, readerStartMenuOptionCount());
+
+	Serial.println();
+	Serial.println("===== Book Menu =====");
+	if (readerResumeShowingCover)
+	{
+		printSerialMenuLine(readerStartMenuCursor == 0, "Resume at cover");
+	}
+	else
+	{
+		const uint32_t resumeGlobal = globalPageForPosition(readerResumeChapterIndex, readerResumePageIndex, false);
+		printSerialMenuLine(readerStartMenuCursor == 0, "Resume at page " + String(resumeGlobal) + "/" + String(readerTotalPagesLoaded));
+	}
+	printSerialMenuLine(readerStartMenuCursor == 1, "Jump to page");
+	printSerialMenuLine(readerStartMenuCursor == 2, "Back to main menu");
+	for (uint16_t i = 0; i < readerChapterPaths.size(); ++i)
+	{
+		printSerialMenuLine(readerStartMenuCursor == static_cast<uint16_t>(i + 3), chapterLabelForDisplay(i));
+	}
+	Serial.println("Controls: up/down move, right select, left back");
+	Serial.print("> ");
+}
+
+void showReaderStartMenu()
+{
+	serialMode = ReaderSerialMode::ReaderStartMenu;
+	readerStartMenuCursor = 0;
+	showReaderStartMenuOnDisplay();
+	printReaderStartMenuToSerial();
+}
+
+void promptReaderJumpToPage()
+{
+	readerJumpTargetChapterIndex = readerResumeChapterIndex;
+	serialMode = ReaderSerialMode::ReaderJumpPageInput;
+
+	display.setRotation(1);
+	display.setFullWindow();
+	display.firstPage();
+	do
+	{
+		display.fillScreen(GxEPD_WHITE);
+		display.setTextColor(GxEPD_BLACK);
+		setDisplayFont(ReaderFontStyle::Bold);
+		display.setCursor(8, uiScreenHeaderY());
+		display.print("Jump to page");
+
+		setDisplayFont(ReaderFontStyle::Normal);
+		display.setCursor(8, uiScreenBodyStartY());
+		display.print("Send page number");
+		display.setCursor(8, static_cast<int16_t>(uiScreenBodyStartY() + static_cast<int16_t>(uiLineStep())));
+		display.print("via serial now");
+	}
+	while (display.nextPage());
+
+	Serial.println();
+	Serial.println("Enter page number to jump to (1-based), or left to go back:");
+	Serial.print("> ");
+}
+
+void handleReaderStartSelection(uint16_t choice)
+{
+	if (choice == 1)
+	{
+		if (!openReaderAtPosition(readerResumeChapterIndex, readerResumePageIndex, readerResumeShowingCover))
+		{
+			Serial.println("Failed to open chapter");
+			showStatusOnDisplay("EPUB error", "Failed to open chapter");
+			delay(1000);
+			showMainMenu();
+		}
+		return;
+	}
+
+	if (choice == 2)
+	{
+		promptReaderJumpToPage();
+		return;
+	}
+
+	if (choice == 3)
+	{
+		clearReaderState();
+		showMainMenu();
+		return;
+	}
+
+	if (choice >= 4)
+	{
+		const uint16_t chapterIndex = static_cast<uint16_t>(choice - 4);
+		if (chapterIndex < readerChapterPaths.size())
+		{
+			if (!openReaderAtPosition(chapterIndex, 0, false))
+			{
+				Serial.println("Failed to open chapter");
+				showStatusOnDisplay("EPUB error", "Failed to open chapter");
+				delay(1000);
+				showMainMenu();
+			}
+			return;
+		}
+	}
+
+	Serial.println("Invalid option");
+	showInvalidOptionOnDisplay();
+	delay(800);
+	showReaderStartMenu();
+}
+
+void handleReaderJumpPageSelection(uint16_t pageNumber)
+{
+	if (pageNumber == 0)
+	{
+		Serial.println("Invalid page number");
+		showInvalidOptionOnDisplay();
+		delay(800);
+		showReaderStartMenu();
+		return;
+	}
+
+	if (readerTotalPagesLoaded == 0)
+	{
+		readerTotalPagesLoaded = 0;
+		for (uint16_t i = 0; i < readerChapterPaths.size() && i < kMaxBooks; ++i)
+		{
+			readerTotalPagesLoaded += readerChapterPageCounts[i];
+		}
+	}
+
+	if (pageNumber > readerTotalPagesLoaded)
+	{
+		pageNumber = static_cast<uint16_t>(readerTotalPagesLoaded);
+	}
+
+	uint16_t globalPageTarget = pageNumber;
+	uint16_t targetChapter = 0;
+	uint16_t pageInChapter = globalPageTarget;
+
+	for (uint16_t i = 0; i < readerChapterPaths.size(); ++i)
+	{
+		if (readerChapterPageCounts[i] == 0)
+		{
+			continue;
+		}
+		if (pageInChapter <= readerChapterPageCounts[i])
+		{
+			targetChapter = i;
+			break;
+		}
+		pageInChapter -= readerChapterPageCounts[i];
+		targetChapter = i + 1;
+	}
+
+	if (targetChapter >= readerChapterPaths.size())
+	{
+		targetChapter = readerChapterPaths.size() - 1;
+		pageInChapter = readerChapterPageCounts[targetChapter];
+	}
+
+	if (pageInChapter == 0)
+	{
+		pageInChapter = 1;
+	}
+
+	if (!openReaderAtPosition(targetChapter, static_cast<uint16_t>(pageInChapter - 1), false))
+	{
+		Serial.println("Failed to open chapter");
+		showStatusOnDisplay("EPUB error", "Failed to open chapter");
+		delay(1000);
+		showMainMenu();
+		return;
+	}
 }
 
 void goToReaderPage(int32_t pageIndex)
@@ -3718,6 +5312,7 @@ void goToReaderPage(int32_t pageIndex)
 		if (pageIndex <= 0)
 		{
 			showReaderCoverOnDisplay();
+			saveCurrentReaderProgress();
 			printReaderHelpToSerial();
 			return;
 		}
@@ -3744,6 +5339,7 @@ void goToReaderPage(int32_t pageIndex)
 		{
 			readerShowingCover = true;
 			showReaderCoverOnDisplay();
+			saveCurrentReaderProgress();
 			printReaderHelpToSerial();
 			return;
 		}
@@ -3769,6 +5365,7 @@ void goToReaderPage(int32_t pageIndex)
 	}
 	readerPageIndex = static_cast<uint16_t>(pageIndex);
 	showReaderPageOnDisplay();
+	saveCurrentReaderProgress();
 	printReaderHelpToSerial();
 }
 
@@ -3837,48 +5434,50 @@ uint16_t refreshBookList()
 
 void printMainMenuToSerial()
 {
+	clampMenuCursor(mainMenuCursor, mainMenuOptionCount());
+
 	Serial.println();
 	Serial.println("===== Ebook Reader =====");
-	Serial.println("Choose an option by number:");
-	Serial.println("1) Upload books");
-	Serial.println("2) Delete books");
-	Serial.println("3) Settings");
+	printSerialMenuLine(mainMenuCursor == 0, "Upload books");
+	printSerialMenuLine(mainMenuCursor == 1, "Delete books");
+	printSerialMenuLine(mainMenuCursor == 2, "Settings");
 	for (uint16_t i = 0; i < bookCount; ++i)
 	{
-		Serial.print(i + 4);
-		Serial.print(") ");
-		Serial.println(bookNames[i]);
+		printSerialMenuLine(mainMenuCursor == static_cast<uint16_t>(i + 3), bookNames[i]);
 	}
 	if (bookCount == 0)
 	{
 		Serial.println("(No books uploaded)");
 	}
+	Serial.println("Controls: up/down move, right select");
 	Serial.print("> ");
 }
 
 void printSettingsMenuToSerial()
 {
+	clampMenuCursor(settingsMenuCursor, settingsMenuOptionCount());
+
 	Serial.println();
 	Serial.println("===== Settings =====");
-	Serial.println("1) Back");
-	Serial.print("2) Font family: ");
-	Serial.println(fontFamilyLabel());
-	Serial.print("3) Font size: ");
-	Serial.println(readerFontSizePt);
-	Serial.print("4) Line spacing: ");
-	Serial.println(lineSpacingLabel());
-	Serial.println("5) Set family to Sans serif");
-	Serial.println("6) Set family to Serif");
-	Serial.println("7) Set family to Mono");
-	Serial.println("8) Set size to 9");
-	Serial.println("9) Set size to 12");
-	Serial.println("10) Set size to 18");
-	Serial.println("11) Set size to 24");
+	printSerialMenuLine(settingsMenuCursor == 0, "Back");
+	printSerialMenuLine(settingsMenuCursor == 1, "Font family: " + String(fontFamilyLabel()));
+	printSerialMenuLine(settingsMenuCursor == 2, "Font size: " + String(readerFontSizePt));
+	printSerialMenuLine(settingsMenuCursor == 3, "Line spacing: " + String(lineSpacingLabel()));
+	printSerialMenuLine(settingsMenuCursor == 4, "Set family to Sans serif");
+	printSerialMenuLine(settingsMenuCursor == 5, "Set family to Serif");
+	printSerialMenuLine(settingsMenuCursor == 6, "Set family to Mono");
+	printSerialMenuLine(settingsMenuCursor == 7, "Set size to 9");
+	printSerialMenuLine(settingsMenuCursor == 8, "Set size to 12");
+	printSerialMenuLine(settingsMenuCursor == 9, "Set size to 18");
+	printSerialMenuLine(settingsMenuCursor == 10, "Set size to 24");
+	Serial.println("Controls: up/down move, right select, left back");
 	Serial.print("> ");
 }
 
 void printDeleteMenuToSerial()
 {
+	clampMenuCursor(deleteMenuCursor, deleteMenuOptionCount());
+
 	Serial.println();
 	Serial.println("===== Delete Books =====");
 	if (bookCount == 0)
@@ -3888,19 +5487,19 @@ void printDeleteMenuToSerial()
 		return;
 	}
 
-	Serial.println("Choose a book to delete:");
-	Serial.println("1) Cancel");
+	printSerialMenuLine(deleteMenuCursor == 0, "Cancel");
 	for (uint16_t i = 0; i < bookCount; ++i)
 	{
-		Serial.print(i + 2);
-		Serial.print(") ");
-		Serial.println(bookNames[i]);
+		printSerialMenuLine(deleteMenuCursor == static_cast<uint16_t>(i + 1), bookNames[i]);
 	}
+	Serial.println("Controls: up/down move, right select, left back");
 	Serial.print("> ");
 }
 
 void showMainMenuOnDisplay()
 {
+	clampMenuCursor(mainMenuCursor, mainMenuOptionCount());
+
 	display.setRotation(1);
 	display.setFullWindow();
 	display.firstPage();
@@ -3915,29 +5514,43 @@ void showMainMenuOnDisplay()
 
 		setDisplayFont(ReaderFontStyle::Normal);
 		int16_t y = uiScreenBodyStartY();
-		const uint16_t maxCharacters = uiCharsPerLine(display.width() - 20);
-		display.setCursor(8, y);
-		display.print("1. Upload books");
+		const uint16_t maxCharacters = uiCharsPerLine(display.width() - 32);
+		if (mainMenuCursor == 0)
+		{
+			drawMenuCursorTriangle(y);
+		}
+		display.setCursor(20, y);
+		display.print("Upload books");
 		y += static_cast<int16_t>(uiLineStep());
-		display.setCursor(8, y);
-		display.print("2. Delete books");
+		if (mainMenuCursor == 1)
+		{
+			drawMenuCursorTriangle(y);
+		}
+		display.setCursor(20, y);
+		display.print("Delete books");
 		y += static_cast<int16_t>(uiLineStep());
-		display.setCursor(8, y);
-		display.print("3. Settings");
+		if (mainMenuCursor == 2)
+		{
+			drawMenuCursorTriangle(y);
+		}
+		display.setCursor(20, y);
+		display.print("Settings");
 		y += static_cast<int16_t>(uiLineStep());
 
 		if (bookCount == 0)
 		{
-			display.setCursor(8, y);
+			display.setCursor(20, y);
 			display.print("No books uploaded yet");
 		}
 
 		for (uint16_t i = 0; i < bookCount; ++i)
 		{
-			display.setCursor(8, y);
-			display.print(i + 4);
-			display.print(". ");
-			display.print(truncateForDisplay(bookNames[i], maxCharacters - 4));
+			if (mainMenuCursor == static_cast<uint16_t>(i + 3))
+			{
+				drawMenuCursorTriangle(y);
+			}
+			display.setCursor(20, y);
+			display.print(truncateForDisplay(bookNames[i], maxCharacters));
 			y += static_cast<int16_t>(uiLineStep());
 			if (y > display.height() - 8)
 			{
@@ -3950,6 +5563,8 @@ void showMainMenuOnDisplay()
 
 void showDeleteMenuOnDisplay()
 {
+	clampMenuCursor(deleteMenuCursor, deleteMenuOptionCount());
+
 	display.setRotation(1);
 	display.setFullWindow();
 	display.firstPage();
@@ -3963,23 +5578,29 @@ void showDeleteMenuOnDisplay()
 
 		setDisplayFont(ReaderFontStyle::Normal);
 		int16_t y = uiScreenBodyStartY();
-		const uint16_t maxCharacters = uiCharsPerLine(display.width() - 20);
-		display.setCursor(8, y);
-		display.print("1. Cancel");
+		const uint16_t maxCharacters = uiCharsPerLine(display.width() - 32);
+		if (deleteMenuCursor == 0)
+		{
+			drawMenuCursorTriangle(y);
+		}
+		display.setCursor(20, y);
+		display.print("Cancel");
 		y += static_cast<int16_t>(uiLineStep());
 
 		if (bookCount == 0)
 		{
-			display.setCursor(8, y);
+			display.setCursor(20, y);
 			display.print("No books to delete");
 		}
 
 		for (uint16_t i = 0; i < bookCount; ++i)
 		{
-			display.setCursor(8, y);
-			display.print(i + 2);
-			display.print(". ");
-			display.print(truncateForDisplay(bookNames[i], maxCharacters - 4));
+			if (deleteMenuCursor == static_cast<uint16_t>(i + 1))
+			{
+				drawMenuCursorTriangle(y);
+			}
+			display.setCursor(20, y);
+			display.print(truncateForDisplay(bookNames[i], maxCharacters));
 			y += static_cast<int16_t>(uiLineStep());
 			if (y > display.height() - 8)
 			{
@@ -4047,7 +5668,7 @@ void showInvalidOptionOnDisplay()
 
 		setDisplayFont(ReaderFontStyle::Normal);
 		display.setCursor(8, uiScreenBodyStartY());
-		display.print("Use serial input number.");
+		display.print("Use up/down/left/right.");
 	}
 	while (display.nextPage());
 }
@@ -4104,6 +5725,8 @@ void showUploadPortalOnDisplay(const IPAddress& ipAddress)
 
 void showSettingsMenuOnDisplay()
 {
+	clampMenuCursor(settingsMenuCursor, settingsMenuOptionCount());
+
 	display.setRotation(1);
 	display.setFullWindow();
 	display.firstPage();
@@ -4117,32 +5740,86 @@ void showSettingsMenuOnDisplay()
 
 		setDisplayFont(ReaderFontStyle::Normal);
 		int16_t y = uiScreenBodyStartY();
-		display.setCursor(8, y);
-		display.print("1. Back");
+		const uint16_t maxChars = uiCharsPerLine(display.width() - 32);
+		if (settingsMenuCursor == 0)
+		{
+			drawMenuCursorTriangle(y);
+		}
+		display.setCursor(20, y);
+		display.print("Back");
 		y += static_cast<int16_t>(uiLineStep());
-		display.setCursor(8, y);
-		display.print("2. Family: ");
+		if (settingsMenuCursor == 1)
+		{
+			drawMenuCursorTriangle(y);
+		}
+		display.setCursor(20, y);
+		display.print("Family: ");
 		display.print(fontFamilyLabel());
 		y += static_cast<int16_t>(uiLineStep());
-		display.setCursor(8, y);
-		display.print("3. Size: ");
+		if (settingsMenuCursor == 2)
+		{
+			drawMenuCursorTriangle(y);
+		}
+		display.setCursor(20, y);
+		display.print("Size: ");
 		display.print(readerFontSizePt);
 		y += static_cast<int16_t>(uiLineStep());
-		display.setCursor(8, y);
-		display.print("4. Line spacing: ");
+		if (settingsMenuCursor == 3)
+		{
+			drawMenuCursorTriangle(y);
+		}
+		display.setCursor(20, y);
+		display.print("Line spacing: ");
 		display.print(lineSpacingLabel());
 		y += static_cast<int16_t>(uiLineStep());
-		display.setCursor(8, y);
-		display.print("5. Sans serif");
+		if (settingsMenuCursor == 4)
+		{
+			drawMenuCursorTriangle(y);
+		}
+		display.setCursor(20, y);
+		display.print("Sans serif");
 		y += static_cast<int16_t>(uiLineStep());
-		display.setCursor(8, y);
-		display.print("6. Serif");
+		if (settingsMenuCursor == 5)
+		{
+			drawMenuCursorTriangle(y);
+		}
+		display.setCursor(20, y);
+		display.print("Serif");
 		y += static_cast<int16_t>(uiLineStep());
-		display.setCursor(8, y);
-		display.print("7. Mono");
+		if (settingsMenuCursor == 6)
+		{
+			drawMenuCursorTriangle(y);
+		}
+		display.setCursor(20, y);
+		display.print("Mono");
 		y += static_cast<int16_t>(uiLineStep());
-		display.setCursor(8, y);
-		display.print("8/9/10/11 -> 9/12/18/24");
+		if (settingsMenuCursor == 7)
+		{
+			drawMenuCursorTriangle(y);
+		}
+		display.setCursor(20, y);
+		display.print(truncateForDisplay("Size to 9", maxChars));
+		y += static_cast<int16_t>(uiLineStep());
+		if (settingsMenuCursor == 8)
+		{
+			drawMenuCursorTriangle(y);
+		}
+		display.setCursor(20, y);
+		display.print(truncateForDisplay("Size to 12", maxChars));
+		y += static_cast<int16_t>(uiLineStep());
+		if (settingsMenuCursor == 9)
+		{
+			drawMenuCursorTriangle(y);
+		}
+		display.setCursor(20, y);
+		display.print(truncateForDisplay("Size to 18", maxChars));
+		y += static_cast<int16_t>(uiLineStep());
+		if (settingsMenuCursor == 10)
+		{
+			drawMenuCursorTriangle(y);
+		}
+		display.setCursor(20, y);
+		display.print(truncateForDisplay("Size to 24", maxChars));
 	}
 	while (display.nextPage());
 }
@@ -4250,6 +5927,7 @@ void showMainMenu()
 {
 	serialMode = ReaderSerialMode::MainMenu;
 	refreshBookList();
+	mainMenuCursor = 0;
 	showMainMenuOnDisplay();
 	printMainMenuToSerial();
 }
@@ -4258,6 +5936,7 @@ void showDeleteMenu()
 {
 	serialMode = ReaderSerialMode::DeleteMenu;
 	refreshBookList();
+	deleteMenuCursor = 0;
 	if (bookCount == 0)
 	{
 		showStatusOnDisplay("Delete books", "No books to delete");
@@ -4272,6 +5951,7 @@ void showDeleteMenu()
 void showSettingsMenu()
 {
 	serialMode = ReaderSerialMode::SettingsMenu;
+	settingsMenuCursor = 0;
 	showSettingsMenuOnDisplay();
 	printSettingsMenuToSerial();
 }
@@ -4423,7 +6103,7 @@ void handleMenuSelection(uint16_t choice)
 		Serial.println(selectedBook);
 		if (openBookReader(selectedBook))
 		{
-			goToReaderPage(0);
+			showReaderStartMenu();
 		}
 		else
 		{
@@ -4468,6 +6148,242 @@ void handleReaderSelection(uint16_t choice)
 	printReaderHelpToSerial();
 }
 
+bool handleSerialNavInput(SerialNavInput nav)
+{
+	if (nav == SerialNavInput::None)
+	{
+		return false;
+	}
+
+	if (serialMode == ReaderSerialMode::MainMenu)
+	{
+		if (nav == SerialNavInput::Up)
+		{
+			moveMenuCursor(mainMenuCursor, mainMenuOptionCount(), -1);
+			showMainMenuOnDisplay();
+			printMainMenuToSerial();
+			return true;
+		}
+		if (nav == SerialNavInput::Down)
+		{
+			moveMenuCursor(mainMenuCursor, mainMenuOptionCount(), 1);
+			showMainMenuOnDisplay();
+			printMainMenuToSerial();
+			return true;
+		}
+		if (nav == SerialNavInput::Right)
+		{
+			if (mainMenuCursor >= 3 && mainMenuCursor < static_cast<uint16_t>(3 + bookCount))
+			{
+				const String selectedBook = bookNames[mainMenuCursor - 3];
+				Serial.print("Selected: ");
+				Serial.println(selectedBook);
+				if (openBookReader(selectedBook))
+				{
+					if (!openReaderAtPosition(readerResumeChapterIndex, readerResumePageIndex, readerHasCover))
+					{
+						Serial.println("Failed to open EPUB");
+						showStatusOnDisplay("EPUB error", selectedBook);
+						delay(1000);
+						showMainMenu();
+					}
+				}
+				else
+				{
+					Serial.println("Failed to open EPUB");
+					showStatusOnDisplay("EPUB error", selectedBook);
+					delay(1000);
+					showMainMenu();
+				}
+				return true;
+			}
+
+			handleMenuSelection(static_cast<uint16_t>(mainMenuCursor + 1));
+			return true;
+		}
+		if (nav == SerialNavInput::Left)
+		{
+			if (mainMenuCursor >= 3 && mainMenuCursor < static_cast<uint16_t>(3 + bookCount))
+			{
+				const String selectedBook = bookNames[mainMenuCursor - 3];
+				Serial.print("Selected: ");
+				Serial.println(selectedBook);
+				if (openBookReader(selectedBook))
+				{
+					showReaderStartMenu();
+				}
+				else
+				{
+					Serial.println("Failed to open EPUB");
+					showStatusOnDisplay("EPUB error", selectedBook);
+					delay(1000);
+					showMainMenu();
+				}
+				return true;
+			}
+
+			printMainMenuToSerial();
+			return true;
+		}
+	}
+
+	if (serialMode == ReaderSerialMode::DeleteMenu)
+	{
+		if (nav == SerialNavInput::Left)
+		{
+			showMainMenu();
+			return true;
+		}
+		if (nav == SerialNavInput::Up)
+		{
+			moveMenuCursor(deleteMenuCursor, deleteMenuOptionCount(), -1);
+			showDeleteMenuOnDisplay();
+			printDeleteMenuToSerial();
+			return true;
+		}
+		if (nav == SerialNavInput::Down)
+		{
+			moveMenuCursor(deleteMenuCursor, deleteMenuOptionCount(), 1);
+			showDeleteMenuOnDisplay();
+			printDeleteMenuToSerial();
+			return true;
+		}
+		if (nav == SerialNavInput::Right)
+		{
+			handleDeleteSelection(static_cast<uint16_t>(deleteMenuCursor + 1));
+			return true;
+		}
+	}
+
+	if (serialMode == ReaderSerialMode::SettingsMenu)
+	{
+		if (nav == SerialNavInput::Left)
+		{
+			showMainMenu();
+			return true;
+		}
+		if (nav == SerialNavInput::Up)
+		{
+			moveMenuCursor(settingsMenuCursor, settingsMenuOptionCount(), -1);
+			showSettingsMenuOnDisplay();
+			printSettingsMenuToSerial();
+			return true;
+		}
+		if (nav == SerialNavInput::Down)
+		{
+			moveMenuCursor(settingsMenuCursor, settingsMenuOptionCount(), 1);
+			showSettingsMenuOnDisplay();
+			printSettingsMenuToSerial();
+			return true;
+		}
+		if (nav == SerialNavInput::Right)
+		{
+			handleSettingsSelection(static_cast<uint16_t>(settingsMenuCursor + 1));
+			return true;
+		}
+	}
+
+	if (serialMode == ReaderSerialMode::ReaderStartMenu)
+	{
+		if (nav == SerialNavInput::Left)
+		{
+			clearReaderState();
+			showMainMenu();
+			return true;
+		}
+		if (nav == SerialNavInput::Up)
+		{
+			moveMenuCursor(readerStartMenuCursor, readerStartMenuOptionCount(), -1);
+			showReaderStartMenuOnDisplay();
+			printReaderStartMenuToSerial();
+			return true;
+		}
+		if (nav == SerialNavInput::Down)
+		{
+			moveMenuCursor(readerStartMenuCursor, readerStartMenuOptionCount(), 1);
+			showReaderStartMenuOnDisplay();
+			printReaderStartMenuToSerial();
+			return true;
+		}
+		if (nav == SerialNavInput::Right)
+		{
+			handleReaderStartSelection(static_cast<uint16_t>(readerStartMenuCursor + 1));
+			return true;
+		}
+	}
+
+	if (serialMode == ReaderSerialMode::ReaderJumpPageInput)
+	{
+		if (nav == SerialNavInput::Left)
+		{
+			showReaderStartMenu();
+			return true;
+		}
+		if (nav == SerialNavInput::Up || nav == SerialNavInput::Down || nav == SerialNavInput::Right)
+		{
+			Serial.println("Jump-to-page still expects a page number for now.");
+			Serial.print("> ");
+			return true;
+		}
+	}
+
+	if (serialMode == ReaderSerialMode::ReaderMenu)
+	{
+		if (nav == SerialNavInput::Up)
+		{
+			if (!readerShowingCover)
+			{
+				goToReaderPage(static_cast<int32_t>(readerPageIndex) - 1);
+			}
+			return true;
+		}
+		if (nav == SerialNavInput::Down)
+		{
+			if (!readerShowingCover)
+			{
+				goToReaderPage(static_cast<int32_t>(readerPageIndex) + 1);
+			}
+			return true;
+		}
+		if (nav == SerialNavInput::Left)
+		{
+			if (readerShowingCover)
+			{
+				clearReaderState();
+				showMainMenu();
+			}
+			else if (readerHasCover)
+			{
+				readerCoverReturnPageIndex = readerPageIndex;
+				readerShowingCover = true;
+				showReaderCoverOnDisplay();
+				saveCurrentReaderProgress();
+				printReaderHelpToSerial();
+			}
+			else
+			{
+				clearReaderState();
+				showMainMenu();
+			}
+			return true;
+		}
+		if (nav == SerialNavInput::Right)
+		{
+			if (readerShowingCover)
+			{
+				Serial.println("[NAV] Exiting cover, going to first page");
+				readerShowingCover = false;
+				goToReaderPage(static_cast<int32_t>(readerCoverReturnPageIndex));
+				return true;
+			}
+			printReaderHelpToSerial();
+			return true;
+		}
+	}
+
+	return false;
+}
+
 void handleSerialInput()
 {
 	while (Serial.available() > 0)
@@ -4481,8 +6397,15 @@ void handleSerialInput()
 		{
 			if (serialLineBuffer.length() > 0)
 			{
-				const int value = serialLineBuffer.toInt();
+				const String input = serialLineBuffer;
 				serialLineBuffer = "";
+
+				if (handleSerialNavInput(parseSerialNavInput(input)))
+				{
+					continue;
+				}
+
+				const int value = input.toInt();
 				if (value > 0)
 				{
 					if (serialMode == ReaderSerialMode::DeleteMenu)
@@ -4492,6 +6415,14 @@ void handleSerialInput()
 					else if (serialMode == ReaderSerialMode::SettingsMenu)
 					{
 						handleSettingsSelection(static_cast<uint16_t>(value));
+					}
+					else if (serialMode == ReaderSerialMode::ReaderStartMenu)
+					{
+						handleReaderStartSelection(static_cast<uint16_t>(value));
+					}
+					else if (serialMode == ReaderSerialMode::ReaderJumpPageInput)
+					{
+						handleReaderJumpPageSelection(static_cast<uint16_t>(value));
 					}
 					else if (serialMode == ReaderSerialMode::ReaderMenu)
 					{
@@ -4504,7 +6435,7 @@ void handleSerialInput()
 				}
 				else
 				{
-					Serial.println("Please enter a number");
+					Serial.println("Use up/down/left/right");
 					showInvalidOptionOnDisplay();
 					delay(800);
 					if (serialMode == ReaderSerialMode::DeleteMenu)
@@ -4514,6 +6445,14 @@ void handleSerialInput()
 					else if (serialMode == ReaderSerialMode::SettingsMenu)
 					{
 						showSettingsMenu();
+					}
+					else if (serialMode == ReaderSerialMode::ReaderStartMenu)
+					{
+						showReaderStartMenu();
+					}
+					else if (serialMode == ReaderSerialMode::ReaderJumpPageInput)
+					{
+						promptReaderJumpToPage();
 					}
 					else if (serialMode == ReaderSerialMode::ReaderMenu)
 					{
@@ -4543,6 +6482,7 @@ void setup()
 	}
 
 	loadReaderSettings();
+	loadReaderBookmarks();
 
 	#if defined(ESP32) && defined(USE_HSPI_FOR_EPD)
 	hspi.begin(13, 12, 14, 15);
@@ -4571,6 +6511,8 @@ void loop()
 		stopWifiServer();
 		showMainMenu();
 	}
+
+	flushReaderBookmarksToStorage(false);
 
 	delay(2);
 }
