@@ -99,7 +99,7 @@
 #elif IS_GxEPD2_7C(GxEPD2_DISPLAY_CLASS)
 #define MAX_HEIGHT(EPD) (EPD::HEIGHT <= (MAX_DISPLAY_BUFFER_SIZE) / (EPD::WIDTH / 2) ? EPD::HEIGHT : (MAX_DISPLAY_BUFFER_SIZE) / (EPD::WIDTH / 2))
 #endif
-GxEPD2_DISPLAY_CLASS<GxEPD2_DRIVER_CLASS, MAX_HEIGHT(GxEPD2_DRIVER_CLASS)> display(GxEPD2_DRIVER_CLASS(/*CS=*/15, /*DC=*/27, /*RST=*/26, /*BUSY=*/25));
+GxEPD2_DISPLAY_CLASS<GxEPD2_DRIVER_CLASS, MAX_HEIGHT(GxEPD2_DRIVER_CLASS)> display(GxEPD2_DRIVER_CLASS(/*CS=*/44, /*DC=*/10, /*RST=*/38, /*BUSY=*/4));
 #endif
 
 #if defined(ESP32) && defined(USE_HSPI_FOR_EPD)
@@ -172,6 +172,30 @@ enum class SerialNavInput : uint8_t
 	Left,
 	Right,
 };
+
+constexpr uint8_t kButtonPin32 = 3;
+constexpr uint8_t kButtonPin33 = 2;
+constexpr uint8_t kDisplayBusyPin = 4;
+constexpr uint8_t kDisplayResetPin = 38;
+constexpr uint8_t kDisplayDcPin = 10;
+constexpr uint8_t kDisplayCsPin = 44;
+constexpr uint32_t kButtonLongPressMs = 500;
+
+struct ButtonPressTracker
+{
+	uint8_t pin;
+	bool wasPressed = false;
+	bool longPressSent = false;
+	uint32_t pressedAtMs = 0;
+
+	ButtonPressTracker()
+		: pin(0), wasPressed(false), longPressSent(false), pressedAtMs(0)
+	{
+	}
+};
+
+ButtonPressTracker button32Tracker;
+ButtonPressTracker button33Tracker;
 
 uint16_t mainMenuCursor = 0;
 uint16_t deleteMenuCursor = 0;
@@ -1328,6 +1352,53 @@ SerialNavInput parseSerialNavInput(String input)
 	}
 
 	return SerialNavInput::None;
+}
+
+SerialNavInput readButtonEvent(ButtonPressTracker& tracker, SerialNavInput shortPressInput, SerialNavInput longPressInput)
+{
+	const uint32_t nowMs = millis();
+	const bool pressed = digitalRead(tracker.pin) == LOW;
+
+	if (pressed && !tracker.wasPressed)
+	{
+		tracker.wasPressed = true;
+		tracker.longPressSent = false;
+		tracker.pressedAtMs = nowMs;
+		return SerialNavInput::None;
+	}
+
+	if (pressed && tracker.wasPressed)
+	{
+		if (!tracker.longPressSent && (nowMs - tracker.pressedAtMs) >= kButtonLongPressMs)
+		{
+			tracker.longPressSent = true;
+			return longPressInput;
+		}
+		return SerialNavInput::None;
+	}
+
+	if (!pressed && tracker.wasPressed)
+	{
+		tracker.wasPressed = false;
+		if (!tracker.longPressSent)
+		{
+			return shortPressInput;
+		}
+		return SerialNavInput::None;
+	}
+
+	return SerialNavInput::None;
+}
+
+SerialNavInput pollButtonNavInput()
+{
+	const SerialNavInput button32Input = readButtonEvent(button32Tracker, SerialNavInput::Up, SerialNavInput::Left);
+	if (button32Input != SerialNavInput::None)
+	{
+		return button32Input;
+	}
+
+	return readButtonEvent(button33Tracker, SerialNavInput::Down, SerialNavInput::Right);
 }
 
 void drawMenuCursorTriangle(int16_t baselineY)
@@ -2652,9 +2723,9 @@ String markupToText(const String& markup)
 	output.reserve(markup.length() > 32768 ? 32768 : markup.length());
 
 	bool inTag = false;
-	char tagName[16] = {0};
+	static char tagName[16] = {0};
 	uint8_t tagLen = 0;
-	char tagAttrs[96] = {0};
+	static char tagAttrs[96] = {0};
 	uint8_t attrsLen = 0;
 	bool collectingTagName = false;
 	bool sawTagNameChar = false;
@@ -3002,7 +3073,7 @@ bool readCurrentZipEntryToString(UNZIP& zip, String& output, size_t maxBytes = k
 
 	output = "";
 	output.reserve(4096);
-	uint8_t buffer[256];
+	static uint8_t buffer[256];
 	int32_t bytesRead = 0;
 	size_t totalRead = 0;
 	uint32_t chunkCount = 0;
@@ -4596,7 +4667,6 @@ bool drawCoverImageOnDisplay(const char* imagePath, const String& coverPath)
 void showReaderCoverOnDisplay()
 {
 	display.setRotation(1);
-	display.setFullWindow();
 
 	bool coverDecoded = false;
 	if (readerHasCover && !readerCoverPath.isEmpty())
@@ -4610,6 +4680,51 @@ void showReaderCoverOnDisplay()
 			{
 				Serial.print("[COVER] extracted to temp file: ");
 				Serial.println(kReaderCoverTempPath);
+				// Try to determine image bounds and use partial update for faster refresh
+				String lowerPath = String(readerCoverPath);
+				lowerPath.toLowerCase();
+				const bool isJpeg = lowerPath.endsWith(".jpg") || lowerPath.endsWith(".jpeg");
+				const bool isPng = lowerPath.endsWith(".png");
+
+				int dstX = 0;
+				int dstY = 0;
+				int dstW = display.width();
+				int dstH = display.height();
+				int imgW = 0;
+				int imgH = 0;
+
+				if (isJpeg)
+				{
+					JPEGDEC* jpeg = new (std::nothrow) JPEGDEC();
+					if (jpeg)
+					{
+						if (jpeg->open(kReaderCoverTempPath, openLittleFSFileForJpeg, closeLittleFSFileForJpeg, readLittleFSFileForJpeg, seekLittleFSFileForJpeg, drawReaderCoverJpegBlock))
+						{
+							imgW = jpeg->getWidth();
+							imgH = jpeg->getHeight();
+							jpeg->close();
+						}
+						delete jpeg;
+					}
+				}
+				else if (isPng)
+				{
+					PNG* png = new (std::nothrow) PNG();
+					if (png)
+					{
+						if (png->open(kReaderCoverTempPath, openLittleFSFileForPng, closeLittleFSFileForPng, readLittleFSFileForPng, seekLittleFSFileForPng, drawReaderCoverPngLine) == PNG_SUCCESS)
+						{
+							imgW = png->getWidth();
+							imgH = png->getHeight();
+							png->close();
+						}
+						delete png;
+					}
+				}
+
+				// Use full-size partial window to ensure previous contents are cleared
+				display.setPartialWindow(0, 0, display.width(), display.height());
+
 				display.firstPage();
 				do
 				{
@@ -4645,7 +4760,7 @@ void showReaderCoverOnDisplay()
 		Serial.print(readerCoverPath.isEmpty());
 		Serial.println(")");
 		display.setRotation(1);
-		display.setFullWindow();
+		display.setPartialWindow(0, 0, display.width(), display.height());
 		display.firstPage();
 		do
 		{
@@ -4766,7 +4881,7 @@ bool appendNextReaderPage()
 		return false;
 	}
 
-	uint8_t buffer[512];
+	static uint8_t buffer[512];
 	const int32_t bytesRead = epubZip->readCurrentFile(buffer, sizeof(buffer));
 	if (bytesRead <= 0)
 	{
@@ -4905,7 +5020,7 @@ void showReaderPageOnDisplay()
 	}
 
 	display.setRotation(1);
-	display.setFullWindow();
+	display.setPartialWindow(0, 0, display.width(), display.height());
 	display.firstPage();
 	do
 	{
@@ -5056,7 +5171,7 @@ void showReaderStartMenuOnDisplay()
 	clampMenuCursor(readerStartMenuCursor, readerStartMenuOptionCount());
 
 	display.setRotation(1);
-	display.setFullWindow();
+	display.setPartialWindow(0, 0, display.width(), display.height());
 	display.firstPage();
 	do
 	{
@@ -5168,7 +5283,7 @@ void promptReaderJumpToPage()
 	serialMode = ReaderSerialMode::ReaderJumpPageInput;
 
 	display.setRotation(1);
-	display.setFullWindow();
+	display.setPartialWindow(0, 0, display.width(), display.height());
 	display.firstPage();
 	do
 	{
@@ -5501,7 +5616,7 @@ void showMainMenuOnDisplay()
 	clampMenuCursor(mainMenuCursor, mainMenuOptionCount());
 
 	display.setRotation(1);
-	display.setFullWindow();
+	display.setPartialWindow(0, 0, display.width(), display.height());
 	display.firstPage();
 	do
 	{
@@ -5566,7 +5681,7 @@ void showDeleteMenuOnDisplay()
 	clampMenuCursor(deleteMenuCursor, deleteMenuOptionCount());
 
 	display.setRotation(1);
-	display.setFullWindow();
+	display.setPartialWindow(0, 0, display.width(), display.height());
 	display.firstPage();
 	do
 	{
@@ -5614,7 +5729,7 @@ void showDeleteMenuOnDisplay()
 void showStatusOnDisplay(const String& title, const String& line)
 {
 	display.setRotation(1);
-	display.setFullWindow();
+	display.setPartialWindow(0, 0, display.width(), display.height());
 	display.firstPage();
 	do
 	{
@@ -5634,7 +5749,7 @@ void showStatusOnDisplay(const String& title, const String& line)
 void showBookSelectedOnDisplay(const String& bookName)
 {
 	display.setRotation(1);
-	display.setFullWindow();
+	display.setPartialWindow(0, 0, display.width(), display.height());
 	display.firstPage();
 	do
 	{
@@ -5656,7 +5771,7 @@ void showBookSelectedOnDisplay(const String& bookName)
 void showInvalidOptionOnDisplay()
 {
 	display.setRotation(1);
-	display.setFullWindow();
+	display.setPartialWindow(0, 0, display.width(), display.height());
 	display.firstPage();
 	do
 	{
@@ -5676,7 +5791,7 @@ void showInvalidOptionOnDisplay()
 void showUploadPortalOnDisplay(const IPAddress& ipAddress)
 {
 	display.setRotation(1);
-	display.setFullWindow();
+	display.setPartialWindow(0, 0, display.width(), display.height());
 	display.firstPage();
 	do
 	{
@@ -5728,7 +5843,7 @@ void showSettingsMenuOnDisplay()
 	clampMenuCursor(settingsMenuCursor, settingsMenuOptionCount());
 
 	display.setRotation(1);
-	display.setFullWindow();
+	display.setPartialWindow(0, 0, display.width(), display.height());
 	display.firstPage();
 	do
 	{
@@ -6475,6 +6590,16 @@ void setup()
 {
 	Serial.begin(115200);
 	delay(200);
+	button32Tracker.pin = kButtonPin32;
+	button32Tracker.wasPressed = false;
+	button32Tracker.longPressSent = false;
+	button32Tracker.pressedAtMs = 0;
+	button33Tracker.pin = kButtonPin33;
+	button33Tracker.wasPressed = false;
+	button33Tracker.longPressSent = false;
+	button33Tracker.pressedAtMs = 0;
+	pinMode(kButtonPin32, INPUT_PULLUP);
+	pinMode(kButtonPin33, INPUT_PULLUP);
 
 	if (!LittleFS.begin(true))
 	{
@@ -6485,7 +6610,7 @@ void setup()
 	loadReaderBookmarks();
 
 	#if defined(ESP32) && defined(USE_HSPI_FOR_EPD)
-	hspi.begin(13, 12, 14, 15);
+	hspi.begin(7, 8, 9, 44);
 	display.epd2.selectSPI(hspi, SPISettings(4000000, MSBFIRST, SPI_MODE0));
 	#endif
 
@@ -6496,6 +6621,12 @@ void setup()
 
 void loop()
 {
+	const SerialNavInput buttonNavInput = pollButtonNavInput();
+	if (buttonNavInput != SerialNavInput::None)
+	{
+		handleSerialNavInput(buttonNavInput);
+	}
+
 	if (wifiServerRunning)
 	{
 		server.handleClient();
