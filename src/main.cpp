@@ -68,6 +68,7 @@
 
 #include <PNGdec.h>
 #include <SPI.h>
+#include <SD.h>
 #include <unzipLIB.h>
 #include <WebServer.h>
 #include <WiFi.h>
@@ -121,6 +122,7 @@ WebServer server(kWebPort);
 bool wifiServerRunning = false;
 bool shutdownRequested = false;
 bool uploadSucceeded = false;
+bool sdMounted = false;
 
 enum class ReaderSerialMode : uint8_t
 {
@@ -1273,6 +1275,7 @@ void goToReaderPage(int32_t pageIndex);
 void showStatusOnDisplay(const String& title, const String& line);
 void showMainMenu();
 void showInvalidOptionOnDisplay();
+String formatStorageSummary();
 uint32_t computeReaderIndexSignature(const String& normalizedPath, const std::vector<String>& chapterPaths);
 bool tryLoadReaderIndexCache(uint32_t signature, uint16_t chapterCount);
 void saveReaderIndexCache(uint32_t signature, uint16_t chapterCount, uint32_t totalPages);
@@ -5526,23 +5529,49 @@ String buildBookListHtml()
 uint16_t refreshBookList()
 {
 	bookCount = 0;
-	File root = LittleFS.open("/");
-	if (!root)
+	
+	// Use SD card if mounted, otherwise use LittleFS
+	if (sdMounted)
 	{
-		return 0;
-	}
-
-	File file = root.openNextFile();
-	while (file && bookCount < kMaxBooks)
-	{
-		if (file.isDirectory())
+		File root = SD.open("/");
+		if (!root)
 		{
-			file = root.openNextFile();
-			continue;
+			return 0;
 		}
-		bookNames[bookCount] = String(file.name());
-		++bookCount;
-		file = root.openNextFile();
+
+		File file = root.openNextFile();
+		while (file && bookCount < kMaxBooks)
+		{
+			if (file.isDirectory())
+			{
+				file = root.openNextFile();
+				continue;
+			}
+			bookNames[bookCount] = String(file.name());
+			++bookCount;
+			file = root.openNextFile();
+		}
+	}
+	else
+	{
+		File root = LittleFS.open("/");
+		if (!root)
+		{
+			return 0;
+		}
+
+		File file = root.openNextFile();
+		while (file && bookCount < kMaxBooks)
+		{
+			if (file.isDirectory())
+			{
+				file = root.openNextFile();
+				continue;
+			}
+			bookNames[bookCount] = String(file.name());
+			++bookCount;
+			file = root.openNextFile();
+		}
 	}
 	return bookCount;
 }
@@ -5553,6 +5582,8 @@ void printMainMenuToSerial()
 
 	Serial.println();
 	Serial.println("===== Ebook Reader =====");
+	Serial.println("Storage: " + formatStorageSummary());
+	Serial.println();
 	printSerialMenuLine(mainMenuCursor == 0, "Upload books");
 	printSerialMenuLine(mainMenuCursor == 1, "Delete books");
 	printSerialMenuLine(mainMenuCursor == 2, "Settings");
@@ -5611,6 +5642,38 @@ void printDeleteMenuToSerial()
 	Serial.print("> ");
 }
 
+String formatStorageSummary()
+{
+	if (!sdMounted)
+	{
+		return "SD Card: Not detected";
+	}
+
+	uint64_t cardSize = SD.cardSize();
+
+	// Format size for display
+	String sizeStr;
+	
+	if (cardSize >= 1024ULL * 1024ULL * 1024ULL)
+	{
+		sizeStr = String(cardSize / (1024ULL * 1024ULL * 1024ULL)) + "GB";
+	}
+	else if (cardSize >= 1024ULL * 1024ULL)
+	{
+		sizeStr = String(cardSize / (1024ULL * 1024ULL)) + "MB";
+	}
+	else if (cardSize >= 1024ULL)
+	{
+		sizeStr = String(cardSize / 1024ULL) + "KB";
+	}
+	else
+	{
+		sizeStr = String(cardSize) + "B";
+	}
+
+	return "SD Card: " + sizeStr;
+}
+
 void showMainMenuOnDisplay()
 {
 	clampMenuCursor(mainMenuCursor, mainMenuOptionCount());
@@ -5630,6 +5693,14 @@ void showMainMenuOnDisplay()
 		setDisplayFont(ReaderFontStyle::Normal);
 		int16_t y = uiScreenBodyStartY();
 		const uint16_t maxCharacters = uiCharsPerLine(display.width() - 32);
+		
+		// Display storage information
+		display.setCursor(8, y);
+		display.setTextColor(GxEPD_BLACK);
+		String storageInfo = formatStorageSummary();
+		display.print(storageInfo);
+		y += static_cast<int16_t>(uiLineStep());
+		
 		if (mainMenuCursor == 0)
 		{
 			drawMenuCursorTriangle(y);
@@ -6604,6 +6675,21 @@ void setup()
 	if (!LittleFS.begin(true))
 	{
 		Serial.println("LittleFS mount failed");
+	}
+
+	// Initialize SD card with custom SPI pins
+	// CS=GPIO39, MOSI=GPIO11, MISO=GPIO12, CLK=GPIO13
+	SPI.begin(13, 12, 11, -1);
+	if (SD.begin(39, SPI, 1000000))
+	{
+		sdMounted = true;
+		Serial.println("SD card mounted successfully");
+		refreshBookList();
+	}
+	else
+	{
+		sdMounted = false;
+		Serial.println("SD card mount failed");
 	}
 
 	loadReaderSettings();
