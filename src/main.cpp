@@ -50,7 +50,6 @@
 
 #include <GxEPD2_BW.h>
 #include <tinyxml2.h>
-#include <LittleFS.h>
 #include <JPEGDEC.h>
 
 #ifdef INTELSHORT
@@ -68,6 +67,7 @@
 
 #include <PNGdec.h>
 #include <SPI.h>
+#include <SD.h>
 #include <unzipLIB.h>
 #include <WebServer.h>
 #include <WiFi.h>
@@ -121,6 +121,46 @@ WebServer server(kWebPort);
 bool wifiServerRunning = false;
 bool shutdownRequested = false;
 bool uploadSucceeded = false;
+bool sdMounted = false;
+
+// Recover SD card state if SPI bus is corrupted after display operations
+void recoverSdCardIfNeeded()
+{
+	if (!sdMounted)
+	{
+		return;
+	}
+
+	// Don't try to reinit SPI - just verify state and wait for stabilization
+	delay(200);
+	yield();
+	// If we can access root, state is likely OK
+	File test = SD.open("/");
+	if (!test)
+	{
+		Serial.println("[SD] Bus in bad state - attempting recovery");
+		delay(500);
+		// Try SPI.end() and reinit
+		SPI.end();
+		delay(200);
+		SPI.begin(13, 12, 11, -1);
+		delay(200);
+		// Re-init SD at lower frequency
+		if (!SD.begin(39, SPI, 500000))
+		{
+			Serial.println("[SD] Recovery failed - SD card lost");
+			sdMounted = false;
+		}
+		else
+		{
+			Serial.println("[SD] Recovery succeeded");
+		}
+	}
+	else
+	{
+		test.close();
+	}
+}
 
 enum class ReaderSerialMode : uint8_t
 {
@@ -316,9 +356,9 @@ struct ReaderCoverDrawContext
 	size_t pngLineCapacity = 0;
 };
 
-static void* openLittleFSFileForPng(const char* filename, int32_t* fileSize)
+static void* openSdFileForPng(const char* filename, int32_t* fileSize)
 {
-	File* file = new (std::nothrow) File(LittleFS.open(filename, FILE_READ));
+	File* file = new (std::nothrow) File(SD.open(filename, FILE_READ));
 	if (!file || !(*file))
 	{
 		delete file;
@@ -332,7 +372,7 @@ static void* openLittleFSFileForPng(const char* filename, int32_t* fileSize)
 	return file;
 }
 
-static void closeLittleFSFileForPng(void* handle)
+static void closeSdFileForPng(void* handle)
 {
 	if (!handle)
 	{
@@ -344,7 +384,7 @@ static void closeLittleFSFileForPng(void* handle)
 	delete file;
 }
 
-static int32_t readLittleFSFileForPng(PNGFILE* pFile, uint8_t* buffer, int32_t length)
+static int32_t readSdFileForPng(PNGFILE* pFile, uint8_t* buffer, int32_t length)
 {
 	if (!pFile || !pFile->fHandle)
 	{
@@ -355,7 +395,7 @@ static int32_t readLittleFSFileForPng(PNGFILE* pFile, uint8_t* buffer, int32_t l
 	return static_cast<int32_t>(file->read(buffer, static_cast<size_t>(length)));
 }
 
-static int32_t seekLittleFSFileForPng(PNGFILE* pFile, int32_t position)
+static int32_t seekSdFileForPng(PNGFILE* pFile, int32_t position)
 {
 	if (!pFile || !pFile->fHandle)
 	{
@@ -371,9 +411,9 @@ static int32_t seekLittleFSFileForPng(PNGFILE* pFile, int32_t position)
 	return position;
 }
 
-static void* openLittleFSFileForJpeg(const char* filename, int32_t* fileSize)
+static void* openSdFileForJpeg(const char* filename, int32_t* fileSize)
 {
-	File* file = new (std::nothrow) File(LittleFS.open(filename, FILE_READ));
+	File* file = new (std::nothrow) File(SD.open(filename, FILE_READ));
 	if (!file || !(*file))
 	{
 		delete file;
@@ -387,7 +427,7 @@ static void* openLittleFSFileForJpeg(const char* filename, int32_t* fileSize)
 	return file;
 }
 
-static void closeLittleFSFileForJpeg(void* handle)
+static void closeSdFileForJpeg(void* handle)
 {
 	if (!handle)
 	{
@@ -399,7 +439,7 @@ static void closeLittleFSFileForJpeg(void* handle)
 	delete file;
 }
 
-static int32_t readLittleFSFileForJpeg(JPEGFILE* pFile, uint8_t* buffer, int32_t length)
+static int32_t readSdFileForJpeg(JPEGFILE* pFile, uint8_t* buffer, int32_t length)
 {
 	if (!pFile || !pFile->fHandle)
 	{
@@ -410,7 +450,7 @@ static int32_t readLittleFSFileForJpeg(JPEGFILE* pFile, uint8_t* buffer, int32_t
 	return static_cast<int32_t>(file->read(buffer, static_cast<size_t>(length)));
 }
 
-static int32_t seekLittleFSFileForJpeg(JPEGFILE* pFile, int32_t position)
+static int32_t seekSdFileForJpeg(JPEGFILE* pFile, int32_t position)
 {
 	if (!pFile || !pFile->fHandle)
 	{
@@ -526,8 +566,14 @@ bool extractNamedZipEntryToFile(UNZIP& zip, const char* entryName, const char* o
 		return false;
 	}
 
-	LittleFS.remove(outputPath);
-	File outputFile = LittleFS.open(outputPath, FILE_WRITE);
+	if (!sdMounted)
+	{
+		Serial.println("[COVER] SD card not mounted");
+		return false;
+	}
+
+	SD.remove(outputPath);
+	File outputFile = SD.open(outputPath, FILE_WRITE);
 	if (!outputFile)
 	{
 		Serial.print("[COVER] failed to open temp file: ");
@@ -539,7 +585,7 @@ bool extractNamedZipEntryToFile(UNZIP& zip, const char* entryName, const char* o
 	{
 		Serial.println("[COVER] openCurrentFile failed");
 		outputFile.close();
-		LittleFS.remove(outputPath);
+		SD.remove(outputPath);
 		return false;
 	}
 
@@ -554,7 +600,7 @@ bool extractNamedZipEntryToFile(UNZIP& zip, const char* entryName, const char* o
 			Serial.println("[COVER] cover exceeds max buffer size");
 			zip.closeCurrentFile();
 			outputFile.close();
-			LittleFS.remove(outputPath);
+			SD.remove(outputPath);
 			return false;
 		}
 
@@ -564,7 +610,7 @@ bool extractNamedZipEntryToFile(UNZIP& zip, const char* entryName, const char* o
 			Serial.println("[COVER] temp file write failed");
 			zip.closeCurrentFile();
 			outputFile.close();
-			LittleFS.remove(outputPath);
+			SD.remove(outputPath);
 			return false;
 		}
 
@@ -1273,6 +1319,7 @@ void goToReaderPage(int32_t pageIndex);
 void showStatusOnDisplay(const String& title, const String& line);
 void showMainMenu();
 void showInvalidOptionOnDisplay();
+String formatStorageSummary();
 uint32_t computeReaderIndexSignature(const String& normalizedPath, const std::vector<String>& chapterPaths);
 bool tryLoadReaderIndexCache(uint32_t signature, uint16_t chapterCount);
 void saveReaderIndexCache(uint32_t signature, uint16_t chapterCount, uint32_t totalPages);
@@ -1435,7 +1482,7 @@ uint32_t computeReaderIndexSignature(const String& normalizedPath, const std::ve
 	uint32_t hash = 2166136261UL;
 	hash = fnv1aUpdateString(hash, normalizedPath);
 
-	File f = LittleFS.open(normalizedPath, "r");
+	File f = SD.open(normalizedPath, "r");
 	const uint32_t size = f ? static_cast<uint32_t>(f.size()) : 0;
 	if (f)
 	{
@@ -2991,7 +3038,17 @@ String markupToText(const String& markup)
 
 void* epubOpenCallback(const char* filename, int32_t* size)
 {
-	epubFsFile = LittleFS.open(filename, "r");
+	if (!sdMounted)
+	{
+		return nullptr;
+	}
+
+	if (epubFsFile)
+	{
+		epubFsFile.close();
+	}
+
+	epubFsFile = SD.open(filename, "r");
 	if (!epubFsFile)
 	{
 		return nullptr;
@@ -3006,7 +3063,15 @@ void epubCloseCallback(void* pFile)
 	ZIPFILE* pzf = static_cast<ZIPFILE*>(pFile);
 	if (pzf && pzf->fHandle)
 	{
-		static_cast<File*>(pzf->fHandle)->close();
+		File* f = static_cast<File*>(pzf->fHandle);
+		if (*f)
+		{
+			f->close();
+		}
+	}
+	if (epubFsFile)
+	{
+		epubFsFile.close();
 	}
 }
 
@@ -4570,7 +4635,7 @@ bool drawCoverImageOnDisplay(const char* imagePath, const String& coverPath)
 			return false;
 		}
 
-		if (!jpeg->open(imagePath, openLittleFSFileForJpeg, closeLittleFSFileForJpeg, readLittleFSFileForJpeg, seekLittleFSFileForJpeg, drawReaderCoverJpegBlock))
+		if (!jpeg->open(imagePath, openSdFileForJpeg, closeSdFileForJpeg, readSdFileForJpeg, seekSdFileForJpeg, drawReaderCoverJpegBlock))
 		{
 			Serial.println("[COVER] JPEG open failed");
 			delete jpeg;
@@ -4622,7 +4687,7 @@ bool drawCoverImageOnDisplay(const char* imagePath, const String& coverPath)
 
 	ReaderCoverDrawContext context;
 	context.pngDecoder = png;
-	if (png->open(imagePath, openLittleFSFileForPng, closeLittleFSFileForPng, readLittleFSFileForPng, seekLittleFSFileForPng, drawReaderCoverPngLine) != PNG_SUCCESS)
+	if (png->open(imagePath, openSdFileForPng, closeSdFileForPng, readSdFileForPng, seekSdFileForPng, drawReaderCoverPngLine) != PNG_SUCCESS)
 	{
 		Serial.print("[COVER] PNG openRAM failed err=");
 		Serial.println(png->getLastError());
@@ -4671,8 +4736,36 @@ void showReaderCoverOnDisplay()
 	bool coverDecoded = false;
 	if (readerHasCover && !readerCoverPath.isEmpty())
 	{
+		if (!sdMounted)
+		{
+			Serial.println("[COVER] SD card not mounted");
+			readerHasCover = false;
+			readerCoverPath = "";
+		}
+		else
+		{
+			// Recover SD state if needed before cover operations
+			recoverSdCardIfNeeded();
+			delay(100);
+			if (!sdMounted)
+			{
+				Serial.println("[COVER] SD card recovery failed");
+				readerHasCover = false;
+				readerCoverPath = "";
+			}
+		}
+	}
+
+	if (readerHasCover && !readerCoverPath.isEmpty() && sdMounted)
+	{
 		Serial.print("[COVER] attempting path: ");
 		Serial.println(readerCoverPath);
+		
+		// Critical: wait for SPI to stabilize after display rendering
+		delay(300);
+		yield();
+		delay(300);
+		
 		UNZIP* coverZip = new (std::nothrow) UNZIP();
 		if (coverZip && coverZip->openZIP(readerBookPath.c_str(), epubOpenCallback, epubCloseCallback, epubReadCallback, epubSeekCallback) == 0)
 		{
@@ -4698,7 +4791,7 @@ void showReaderCoverOnDisplay()
 					JPEGDEC* jpeg = new (std::nothrow) JPEGDEC();
 					if (jpeg)
 					{
-						if (jpeg->open(kReaderCoverTempPath, openLittleFSFileForJpeg, closeLittleFSFileForJpeg, readLittleFSFileForJpeg, seekLittleFSFileForJpeg, drawReaderCoverJpegBlock))
+						if (jpeg->open(kReaderCoverTempPath, openSdFileForJpeg, closeSdFileForJpeg, readSdFileForJpeg, seekSdFileForJpeg, drawReaderCoverJpegBlock))
 						{
 							imgW = jpeg->getWidth();
 							imgH = jpeg->getHeight();
@@ -4712,7 +4805,7 @@ void showReaderCoverOnDisplay()
 					PNG* png = new (std::nothrow) PNG();
 					if (png)
 					{
-						if (png->open(kReaderCoverTempPath, openLittleFSFileForPng, closeLittleFSFileForPng, readLittleFSFileForPng, seekLittleFSFileForPng, drawReaderCoverPngLine) == PNG_SUCCESS)
+						if (png->open(kReaderCoverTempPath, openSdFileForPng, closeSdFileForPng, readSdFileForPng, seekSdFileForPng, drawReaderCoverPngLine) == PNG_SUCCESS)
 						{
 							imgW = png->getWidth();
 							imgH = png->getHeight();
@@ -4732,7 +4825,11 @@ void showReaderCoverOnDisplay()
 					coverDecoded = drawCoverImageOnDisplay(kReaderCoverTempPath, readerCoverPath);
 				}
 				while (display.nextPage());
-				LittleFS.remove(kReaderCoverTempPath);
+				
+				if (sdMounted)
+				{
+					SD.remove(kReaderCoverTempPath);
+				}
 			}
 			else
 			{
@@ -4743,13 +4840,19 @@ void showReaderCoverOnDisplay()
 		else
 		{
 			Serial.println("[COVER] openZIP failed");
+			readerHasCover = false;
+			readerCoverPath = "";
 		}
 
 		if (coverZip)
 		{
 			delete coverZip;
 		}
-		LittleFS.remove(kReaderCoverTempPath);
+		
+		if (sdMounted)
+		{
+			SD.remove(kReaderCoverTempPath);
+		}
 	}
 
 	if (!coverDecoded)
@@ -4786,6 +4889,26 @@ bool loadReaderChapter(uint16_t chapterIndex)
 	{
 		return false;
 	}
+
+	// Ensure SD card is accessible after display operations
+	if (!sdMounted)
+	{
+		Serial.println("[CHAPTER] SD card not mounted");
+		return false;
+	}
+
+	// Recover SD state if display operations corrupted it
+	recoverSdCardIfNeeded();
+	if (!sdMounted)
+	{
+		return false;
+	}
+
+	// Longer delays to allow SPI to stabilize after display rendering
+	yield();
+	delay(100);
+	yield();
+	delay(100);
 
 	closeReaderChapterStream();
 
@@ -5498,7 +5621,7 @@ String buildBookListHtml()
 	html += "<button type='submit'>Upload</button></form>";
 	html += "<h2>Books on device</h2><ul>";
 
-	File root = LittleFS.open("/");
+	File root = SD.open("/");
 	File file = root.openNextFile();
 	if (!file)
 	{
@@ -5526,7 +5649,13 @@ String buildBookListHtml()
 uint16_t refreshBookList()
 {
 	bookCount = 0;
-	File root = LittleFS.open("/");
+	
+	if (!sdMounted)
+	{
+		return 0;
+	}
+
+	File root = SD.open("/");
 	if (!root)
 	{
 		return 0;
@@ -5553,6 +5682,8 @@ void printMainMenuToSerial()
 
 	Serial.println();
 	Serial.println("===== Ebook Reader =====");
+	Serial.println("Storage: " + formatStorageSummary());
+	Serial.println();
 	printSerialMenuLine(mainMenuCursor == 0, "Upload books");
 	printSerialMenuLine(mainMenuCursor == 1, "Delete books");
 	printSerialMenuLine(mainMenuCursor == 2, "Settings");
@@ -5611,6 +5742,38 @@ void printDeleteMenuToSerial()
 	Serial.print("> ");
 }
 
+String formatStorageSummary()
+{
+	if (!sdMounted)
+	{
+		return "SD Card: Not detected";
+	}
+
+	uint64_t cardSize = SD.cardSize();
+
+	// Format size for display
+	String sizeStr;
+	
+	if (cardSize >= 1024ULL * 1024ULL * 1024ULL)
+	{
+		sizeStr = String(cardSize / (1024ULL * 1024ULL * 1024ULL)) + "GB";
+	}
+	else if (cardSize >= 1024ULL * 1024ULL)
+	{
+		sizeStr = String(cardSize / (1024ULL * 1024ULL)) + "MB";
+	}
+	else if (cardSize >= 1024ULL)
+	{
+		sizeStr = String(cardSize / 1024ULL) + "KB";
+	}
+	else
+	{
+		sizeStr = String(cardSize) + "B";
+	}
+
+	return "SD Card: " + sizeStr;
+}
+
 void showMainMenuOnDisplay()
 {
 	clampMenuCursor(mainMenuCursor, mainMenuOptionCount());
@@ -5630,6 +5793,14 @@ void showMainMenuOnDisplay()
 		setDisplayFont(ReaderFontStyle::Normal);
 		int16_t y = uiScreenBodyStartY();
 		const uint16_t maxCharacters = uiCharsPerLine(display.width() - 32);
+		
+		// Display storage information
+		display.setCursor(8, y);
+		display.setTextColor(GxEPD_BLACK);
+		String storageInfo = formatStorageSummary();
+		display.print(storageInfo);
+		y += static_cast<int16_t>(uiLineStep());
+		
 		if (mainMenuCursor == 0)
 		{
 			drawMenuCursorTriangle(y);
@@ -5814,7 +5985,7 @@ void showUploadPortalOnDisplay(const IPAddress& ipAddress)
 		display.println();
 		display.println("Existing books:");
 
-		File root = LittleFS.open("/");
+		File root = SD.open("/");
 		File file = root.openNextFile();
 		uint16_t count = 0;
 		const uint16_t maxCharacters = uiCharsPerLine(display.width() - 20);
@@ -5964,11 +6135,11 @@ void handleFileUpload()
 	{
 		uploadSucceeded = false;
 		uploadPath = sanitizeFilename(upload.filename);
-		if (LittleFS.exists(uploadPath))
+		if (sdMounted && SD.exists(uploadPath))
 		{
-			LittleFS.remove(uploadPath);
+			SD.remove(uploadPath);
 		}
-		uploadFile = LittleFS.open(uploadPath, FILE_WRITE);
+		uploadFile = sdMounted ? SD.open(uploadPath, FILE_WRITE) : File();
 	}
 	else if (upload.status == UPLOAD_FILE_WRITE)
 	{
@@ -5993,7 +6164,7 @@ void handleFileUpload()
 		}
 		if (!uploadPath.isEmpty())
 		{
-			LittleFS.remove(uploadPath);
+			SD.remove(uploadPath);
 		}
 		uploadSucceeded = false;
 	}
@@ -6167,7 +6338,7 @@ void handleDeleteSelection(uint16_t choice)
 	{
 		const String selectedBook = bookNames[choice - 2];
 		const String deletePath = selectedBook.startsWith("/") ? selectedBook : "/" + selectedBook;
-		if (LittleFS.remove(deletePath.c_str()))
+		if (sdMounted && SD.remove(deletePath.c_str()))
 		{
 			Serial.print("Deleted: ");
 			Serial.println(deletePath);
@@ -6590,6 +6761,8 @@ void setup()
 {
 	Serial.begin(115200);
 	delay(200);
+	Serial.println("\n[SETUP] Starting initialization");
+	
 	button32Tracker.pin = kButtonPin32;
 	button32Tracker.wasPressed = false;
 	button32Tracker.longPressSent = false;
@@ -6601,21 +6774,55 @@ void setup()
 	pinMode(kButtonPin32, INPUT_PULLUP);
 	pinMode(kButtonPin33, INPUT_PULLUP);
 
-	if (!LittleFS.begin(true))
+	// Initialize SD card with custom SPI pins - do this AFTER delay to let hardware settle
+	// CS=GPIO39, MOSI=GPIO11, MISO=GPIO12, CLK=GPIO13
+	delay(500);
+	Serial.println("[SETUP] Initializing SPI for SD card (CLK=13, MOSI=11, MISO=12, CS=39)");
+	SPI.begin(13, 12, 11, -1);
+	delay(100);
+	
+	Serial.println("[SETUP] Attempting SD.begin() with 1MHz frequency");
+	if (SD.begin(39, SPI, 1000000))
 	{
-		Serial.println("LittleFS mount failed");
+		sdMounted = true;
+		Serial.println("[SETUP] SD card mounted successfully");
+		refreshBookList();
+	}
+	else
+	{
+		sdMounted = false;
+		Serial.println("[SETUP] SD card mount failed - retrying at lower frequency");
+		delay(500);
+		SPI.end();
+		delay(100);
+		SPI.begin(13, 12, 11, -1);
+		delay(100);
+		if (SD.begin(39, SPI, 500000))  // Try 500kHz
+		{
+			sdMounted = true;
+			Serial.println("[SETUP] SD card mounted successfully at 500kHz");
+			refreshBookList();
+		}
+		else
+		{
+			Serial.println("[SETUP] SD card mount failed even at 500kHz");
+			sdMounted = false;
+		}
 	}
 
 	loadReaderSettings();
 	loadReaderBookmarks();
 
 	#if defined(ESP32) && defined(USE_HSPI_FOR_EPD)
+	Serial.println("[SETUP] Initializing HSPI for display");
 	hspi.begin(7, 8, 9, 44);
 	display.epd2.selectSPI(hspi, SPISettings(4000000, MSBFIRST, SPI_MODE0));
 	#endif
 
+	Serial.println("[SETUP] Initializing display");
 	display.init(115200);
 	display.setTextWrap(false);
+	Serial.println("[SETUP] Initialization complete");
 	showMainMenu();
 }
 
