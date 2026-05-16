@@ -261,6 +261,7 @@ constexpr const char* kKeyFontSize = "font_size";
 constexpr const char* kKeyLineSpacing = "line_spacing";
 constexpr char kStyleMarker = 0x1D;
 constexpr char kAlignMarker = 0x1E;
+constexpr char kImageMarker = 0x1C;
 std::vector<String> readerCssAlignCenterClasses;
 std::vector<String> readerCssAlignRightClasses;
 
@@ -343,6 +344,9 @@ struct ImageCacheEntry
 };
 
 std::vector<ImageCacheEntry> readerImageCache;
+ImageCacheEntry* getOrCacheImage(const String& imagePath);
+void cacheAndMeasureImage(ImageCacheEntry* entry);
+
 ImageCacheEntry* g_currentImageRef = nullptr;
 bool g_jpegDecodeError = false;
 
@@ -1130,6 +1134,8 @@ ReaderFontStyle trailingStyleForEncodedText(const String& encoded)
 	return style;
 }
 
+void drawImageInline(int16_t x, int16_t y, const String& path);
+
 uint16_t measureEncodedTextWidth(const String& encoded)
 {
 	ReaderFontStyle style = ReaderFontStyle::Normal;
@@ -1154,6 +1160,23 @@ uint16_t measureEncodedTextWidth(const String& encoded)
 	for (size_t i = 0; i < encoded.length(); ++i)
 	{
 		const char ch = encoded[i];
+		if (ch == kImageMarker)
+		{
+			int end = encoded.indexOf(kImageMarker, i + 1);
+			if (end != -1) {
+				flushChunk();
+				String path = encoded.substring(i + 1, end);
+				ImageCacheEntry* img = getOrCacheImage(path);
+				if (img && img->decoded && img->width > 0) {
+					uint16_t w = img->width;
+					uint16_t maxW = display.width() - 16;
+					if (w > maxW) w = maxW;
+					totalWidth = static_cast<uint16_t>(totalWidth + w);
+				}
+				i = end;
+				continue;
+			}
+		}
 		if (ch == kAlignMarker && (i + 1) < encoded.length() && isAlignCodeChar(encoded[i + 1]))
 		{
 			++i;
@@ -1198,6 +1221,25 @@ void drawEncodedTextLine(int16_t x, int16_t y, const String& encoded)
 	for (size_t i = 0; i < encoded.length(); ++i)
 	{
 		const char ch = encoded[i];
+		if (ch == kImageMarker)
+		{
+			int end = encoded.indexOf(kImageMarker, i + 1);
+			if (end != -1) {
+				drawChunk();
+				String path = encoded.substring(i + 1, end);
+				drawImageInline(cursorX, y - readerFontSizePt, path); // y is baseline, images draw from top-left, so adjust y
+				
+				ImageCacheEntry* img = getOrCacheImage(path);
+				if (img && img->decoded && img->width > 0) {
+					uint16_t w = img->width;
+					uint16_t maxW = display.width() - 16;
+					if (w > maxW) w = maxW;
+					cursorX = static_cast<int16_t>(cursorX + w);
+				}
+				i = end;
+				continue;
+			}
+		}
 		if (ch == kAlignMarker && (i + 1) < encoded.length() && isAlignCodeChar(encoded[i + 1]))
 		{
 			++i;
@@ -1681,12 +1723,6 @@ void flushReaderMarkupTextSegment()
 
 bool pushReaderPageLine(const String& encodedLine)
 {
-	if (readerParseCurrentPage.length() > 0)
-	{
-		readerParseCurrentPage += '\n';
-	}
-	readerParseCurrentPage += encodeAlignedLine(encodedLine, readerParseCurrentAlign);
-	++readerParseLineCount;
 	const int32_t usableHeight = static_cast<int32_t>(display.height()) - static_cast<int32_t>(uiReaderBodyStartY()) - 8;
 	uint16_t maxLinesPerPage = 1;
 	if (usableHeight > 0)
@@ -1697,6 +1733,43 @@ bool pushReaderPageLine(const String& encodedLine)
 			maxLinesPerPage = 1;
 		}
 	}
+
+	int32_t extraLines = 0;
+	int imgIndex = encodedLine.indexOf(kImageMarker);
+	if (imgIndex != -1) {
+		int end = encodedLine.indexOf(kImageMarker, imgIndex + 1);
+		if (end != -1) {
+			String path = encodedLine.substring(imgIndex + 1, end);
+			ImageCacheEntry* img = getOrCacheImage(path);
+			if (img) {
+				cacheAndMeasureImage(img);
+				if (img->decoded && img->height > 0) {
+					uint16_t dispW = display.width() - 16;
+					uint16_t h = img->height;
+					if (img->width > dispW) {
+						h = static_cast<uint16_t>((static_cast<uint32_t>(h) * dispW) / img->width);
+					}
+					extraLines = (h + uiLineStep() - 1) / uiLineStep();
+					if (extraLines > 0) extraLines--;
+				}
+			}
+		}
+	}
+
+	if (readerParseLineCount > 0 && readerParseLineCount + 1 + extraLines > maxLinesPerPage)
+	{
+		readerPages.push_back(readerParseCurrentPage);
+		readerParseCurrentPage = encodeAlignedLine(encodedLine, readerParseCurrentAlign);
+		readerParseLineCount = 1 + extraLines;
+		return true;
+	}
+
+	if (readerParseCurrentPage.length() > 0)
+	{
+		readerParseCurrentPage += '\n';
+	}
+	readerParseCurrentPage += encodeAlignedLine(encodedLine, readerParseCurrentAlign);
+	readerParseLineCount += (1 + extraLines);
 
 	if (readerParseLineCount >= maxLinesPerPage)
 	{
@@ -1995,6 +2068,37 @@ void feedReaderMarkupByte(char ch)
 				const bool attrBold = strstr(readerMarkupState.tagAttrs, "bold") || strstr(readerMarkupState.tagAttrs, "font-weight:700") || strstr(readerMarkupState.tagAttrs, "font-weight:800") || strstr(readerMarkupState.tagAttrs, "font-weight:900");
 				const bool isBreakTag = strcmp(normalizedTag, "br") == 0 || strcmp(normalizedTag, "p") == 0 || strcmp(normalizedTag, "div") == 0 || strcmp(normalizedTag, "section") == 0 || strcmp(normalizedTag, "article") == 0 || strcmp(normalizedTag, "li") == 0;
 				const bool isHeaderTag = strcmp(normalizedTag, "h1") == 0 || strcmp(normalizedTag, "h2") == 0 || strcmp(normalizedTag, "h3") == 0 || strcmp(normalizedTag, "h4") == 0 || strcmp(normalizedTag, "h5") == 0 || strcmp(normalizedTag, "h6") == 0;
+				const bool isImgTag = strcmp(normalizedTag, "img") == 0 || strcmp(normalizedTag, "image") == 0;
+
+				if (!isCloseTag && isImgTag)
+				{
+					flushReaderMarkupTextSegment();
+					const char* srcAttr = strstr(readerMarkupState.tagAttrs, "src=\"");
+					if (!srcAttr) srcAttr = strstr(readerMarkupState.tagAttrs, "href=\""); // <image href="...">
+					if (!srcAttr) srcAttr = strstr(readerMarkupState.tagAttrs, "src='");
+					if (srcAttr)
+					{
+						const char quoteChar = srcAttr[4];
+						srcAttr += 5;
+						if (strncmp(srcAttr, "\"", 1) == 0 || strncmp(srcAttr, "'", 1) == 0) {
+							// Account for potential space before quote
+							srcAttr++;
+						}
+						const char* endPtr = strchr(srcAttr, quoteChar);
+						if (endPtr)
+						{
+							String srcPath(srcAttr, endPtr - srcAttr);
+							if (!readerParsedTextBuffer.isEmpty() && readerParsedTextBuffer[readerParsedTextBuffer.length() - 1] != '\n')
+							{
+								readerParsedTextBuffer += '\n';
+							}
+							readerParsedTextBuffer += kImageMarker;
+							readerParsedTextBuffer += srcPath;
+							readerParsedTextBuffer += kImageMarker;
+							readerParsedTextBuffer += '\n';
+						}
+					}
+				}
 
 				if (!isCloseTag && (strcmp(normalizedTag, "strong") == 0 || strcmp(normalizedTag, "b") == 0))
 				{
@@ -2837,11 +2941,13 @@ void extractImagePathsFromMarkup(const String& markup, std::vector<String>& imag
 // Get or cache an image from the EPUB
 ImageCacheEntry* getOrCacheImage(const String& imagePath)
 {
+	Serial.printf("[IMAGE] getOrCacheImage called for: %s\n", imagePath.c_str());
 	// Check if already cached
 	for (auto& entry : readerImageCache)
 	{
 		if (entry.srcPath == imagePath)
 		{
+			Serial.println("[IMAGE] Found in cache");
 			return &entry;
 		}
 	}
@@ -2849,12 +2955,14 @@ ImageCacheEntry* getOrCacheImage(const String& imagePath)
 	// Add to cache if there's room
 	if (readerImageCache.size() < kMaxImageCacheSize)
 	{
+		Serial.println("[IMAGE] Adding to cache");
 		ImageCacheEntry newEntry;
 		newEntry.srcPath = imagePath;
 		readerImageCache.push_back(newEntry);
 		return &readerImageCache.back();
 	}
 
+	Serial.println("[IMAGE] Cache is full!");
 	// Cache is full, return nullptr (should show placeholder)
 	return nullptr;
 }
@@ -2871,6 +2979,66 @@ void clearImageCache()
 		}
 	}
 	readerImageCache.clear();
+}
+
+bool readNamedZipEntryToBytes(UNZIP& zip, const char* entryName, uint8_t*& output, size_t& outputSize, size_t maxBytes);
+
+void cacheAndMeasureImage(ImageCacheEntry* entry)
+{
+	Serial.printf("[IMAGE] cacheAndMeasureImage: %s (decoded=%d, zip=%p)\n", entry->srcPath.c_str(), entry->decoded, epubZip);
+	if (entry->decoded) return;
+	if (!epubZip) return;
+
+	if (!readNamedZipEntryToBytes(*epubZip, entry->srcPath.c_str(), entry->bitmap, entry->bitmapSize, 300000))
+	{
+		Serial.printf("[IMAGE] Failed to read zip entry: %s\n", entry->srcPath.c_str());
+		entry->decoded = true;
+		return;
+	}
+
+	Serial.printf("[IMAGE] Read zip entry OK: %s (%u bytes)\n", entry->srcPath.c_str(), entry->bitmapSize);
+
+	String lowerPath = entry->srcPath;
+	lowerPath.toLowerCase();
+
+	if (lowerPath.endsWith(".jpg") || lowerPath.endsWith(".jpeg"))
+	{
+		JPEGDEC* jpeg = new (std::nothrow) JPEGDEC();
+		if (jpeg)
+		{
+			if (jpeg->openRAM(entry->bitmap, static_cast<int>(entry->bitmapSize), nullptr))
+			{
+				entry->width = jpeg->getWidth();
+				entry->height = jpeg->getHeight();
+				Serial.printf("[IMAGE] JPEG decoded: %dx%d\n", entry->width, entry->height);
+				jpeg->close();
+			} else {
+				Serial.println("[IMAGE] JPEG openRAM failed");
+			}
+			delete jpeg;
+		}
+	}
+	else if (lowerPath.endsWith(".png"))
+	{
+		PNG* png = new (std::nothrow) PNG();
+		if (png)
+		{
+			if (png->openRAM(entry->bitmap, static_cast<int>(entry->bitmapSize), nullptr) == PNG_SUCCESS)
+			{
+				entry->width = png->getWidth();
+				entry->height = png->getHeight();
+				Serial.printf("[IMAGE] PNG decoded: %dx%d\n", entry->width, entry->height);
+				png->close();
+			} else {
+				Serial.println("[IMAGE] PNG openRAM failed");
+			}
+			delete png;
+		}
+	} else {
+		Serial.println("[IMAGE] Unsupported image extension");
+	}
+
+	entry->decoded = true;
 }
 
 String markupToText(const String& markup)
@@ -4556,6 +4724,7 @@ bool countReaderChapterPages(uint16_t chapterIndex, uint16_t& outPageCount)
 	}
 
 	closeReaderChapterStream();
+	clearImageCache();
 	resetReaderPageBuilderState();
 	resetReaderMarkupStreamState();
 	readerChapterInputEnded = false;
@@ -4707,9 +4876,15 @@ uint16_t rgb565ToEpdColor(uint16_t rgb)
 
 int drawReaderCoverJpegBlock(JPEGDRAW* pDraw)
 {
+	static int drawCallCount = 0;
 	ReaderCoverDrawContext* ctx = static_cast<ReaderCoverDrawContext*>(pDraw->pUser);
+	if (drawCallCount++ == 0) {
+		Serial.printf("[IMAGE] drawReaderCoverJpegBlock first call: srcW=%d, srcH=%d, iBpp=%d\n", pDraw->iWidth, pDraw->iHeight, pDraw->iBpp);
+	}
+	Serial.printf("[IMAGE] drawReaderCoverJpegBlock: pDraw=%p, pDraw->pUser=%p, ctx=%p\n", pDraw, pDraw->pUser, ctx);
 	if (!ctx || ctx->srcW == 0 || ctx->srcH == 0 || ctx->dstW == 0 || ctx->dstH == 0)
 	{
+		Serial.printf("[IMAGE] drawReaderCoverJpegBlock early return: ctx=%p, srcW=%d, srcH=%d, dstW=%d, dstH=%d\n", ctx, ctx ? ctx->srcW : 0, ctx ? ctx->srcH : 0, ctx ? ctx->dstW : 0, ctx ? ctx->dstH : 0);
 		return 0;
 	}
 
@@ -4795,6 +4970,86 @@ int drawReaderCoverPngLine(PNGDRAW* pDraw)
 	}
 
 	return 1;
+}
+
+void drawImageInline(int16_t x, int16_t y, const String& path)
+{
+	Serial.printf("[IMAGE] drawImageInline called for path: %s at x=%d, y=%d\n", path.c_str(), x, y);
+	ImageCacheEntry* img = getOrCacheImage(path);
+	if (!img || !img->decoded || img->width == 0) {
+		Serial.printf("[IMAGE] Cannot draw: img=%p, decoded=%d, width=%d\n", img, img ? img->decoded : 0, img ? img->width : 0);
+		return;
+	}
+	Serial.printf("[IMAGE] Proceeding to draw image: outW=%d, outH=%d\n", img->width, img->height);
+
+	String lowerPath = path;
+	lowerPath.toLowerCase();
+
+	uint16_t dispW = display.width() - 16;
+	uint16_t dispH = display.height();
+	uint16_t availableHeight = (y < static_cast<int16_t>(dispH)) ? (dispH - y) : 0;
+	Serial.printf("[IMAGE] dispH=%d, y=%d, availableHeight=%d\n", dispH, y, availableHeight);
+
+	uint16_t outW = img->width;
+	uint16_t outH = img->height;
+	if (outW > dispW)
+	{
+		outH = static_cast<uint16_t>((static_cast<uint32_t>(outH) * dispW) / outW);
+		outW = dispW;
+	}
+	if (outH > availableHeight) {
+		outW = static_cast<uint16_t>((static_cast<uint32_t>(outW) * availableHeight) / outH);
+		outH = availableHeight;
+	}
+	Serial.printf("[IMAGE] After clamping: outW=%d, outH=%d\n", outW, outH);
+
+	ReaderCoverDrawContext context;
+	context.srcW = img->width;
+	context.srcH = img->height;
+	context.dstX = x;
+	context.dstY = y;
+	context.dstW = outW;
+	context.dstH = outH;
+	Serial.printf("[IMAGE] Context created at %p: srcW=%d, srcH=%d, dstX=%d, dstY=%d, dstW=%d, dstH=%d\n", &context, context.srcW, context.srcH, context.dstX, context.dstY, context.dstW, context.dstH);
+
+	if (lowerPath.endsWith(".jpg") || lowerPath.endsWith(".jpeg"))
+	{
+		JPEGDEC* jpeg = new (std::nothrow) JPEGDEC();
+		if (jpeg)
+		{
+			if (jpeg->openRAM(img->bitmap, static_cast<int>(img->bitmapSize), drawReaderCoverJpegBlock))
+			{
+				Serial.printf("[IMAGE] setUserPointer(&context) at %p\n", &context);
+				jpeg->setUserPointer(&context);
+				Serial.println("[IMAGE] JPEG openRAM success, starting decode");
+				jpeg->setPixelType(EIGHT_BIT_GRAYSCALE);
+				jpeg->decode(0, 0, 0);
+				Serial.println("[IMAGE] JPEG decode finished");
+				jpeg->close();
+			}
+			delete jpeg;
+		}
+	}
+	else if (lowerPath.endsWith(".png"))
+	{
+		PNG* png = new (std::nothrow) PNG();
+		if (png)
+		{
+			context.pngDecoder = png;
+			context.scaleDiv = 1;
+			if (png->openRAM(img->bitmap, static_cast<int>(img->bitmapSize), drawReaderCoverPngLine) == PNG_SUCCESS)
+			{
+				png->decode(nullptr, 0);
+				png->close();
+			}
+			delete png;
+		}
+	}
+
+	if (context.pngLineBuffer)
+	{
+		free(context.pngLineBuffer);
+	}
 }
 
 bool drawCoverImageOnDisplay(const char* imagePath, const String& coverPath)
