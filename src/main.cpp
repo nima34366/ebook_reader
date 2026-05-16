@@ -1,4 +1,6 @@
 #include <Arduino.h>
+#include <USB.h>
+#include <USBMSC.h>
 #include <Fonts/FreeMono9pt7b.h>
 #include <Fonts/FreeMonoBold9pt7b.h>
 #include <Fonts/FreeMonoBold12pt7b.h>
@@ -70,6 +72,7 @@
 #include <SD.h>
 #include <unzipLIB.h>
 #include <WebServer.h>
+#include <uri/UriRegex.h>
 #include <WiFi.h>
 #include <Preferences.h>
 #include <new>
@@ -114,7 +117,7 @@ constexpr uint16_t kWebPort = 80;
 constexpr uint16_t kMaxBooks = 64;
 constexpr size_t kReaderMaxExtractBytes = 120000;
 constexpr size_t kReaderMaxBookTextChars = 1200000;
-constexpr size_t kReaderMaxCoverBytes = 300000;
+constexpr size_t kReaderMaxCoverBytes = 3000000;
 constexpr const char* kReaderCoverTempPath = "/reader_cover.tmp";
 
 WebServer server(kWebPort);
@@ -211,6 +214,10 @@ String bookNames[kMaxBooks];
 uint16_t bookCount = 0;
 File uploadFile;
 String uploadPath;
+uint32_t uploadBytesReceived = 0;
+uint32_t uploadChunkOffset = 0;
+uint32_t uploadExpectedTotal = 0;
+bool uploadWriteError = false;
 String readerBookPath;
 String readerBookTitle;
 std::vector<String> readerPages;
@@ -320,6 +327,24 @@ struct ReaderCoverDrawContext
 	uint16_t* pngLineBuffer = nullptr;
 	size_t pngLineCapacity = 0;
 };
+
+// Image cache for inline images
+constexpr uint16_t kMaxImageCacheSize = 16;
+constexpr uint16_t kMaxImageDimension = 600;
+
+struct ImageCacheEntry
+{
+	String srcPath;
+	uint16_t width = 0;
+	uint16_t height = 0;
+	uint8_t* bitmap = nullptr;
+	size_t bitmapSize = 0;
+	bool decoded = false;
+};
+
+std::vector<ImageCacheEntry> readerImageCache;
+ImageCacheEntry* g_currentImageRef = nullptr;
+bool g_jpegDecodeError = false;
 
 static void* openLittleFSFileForPng(const char* filename, int32_t* fileSize)
 {
@@ -2723,6 +2748,131 @@ String xmlDocumentToText(tinyxml2::XMLDocument& document)
 	return output;
 }
 
+// Extract image src paths from HTML markup
+void extractImagePathsFromMarkup(const String& markup, std::vector<String>& imagePaths)
+{
+	imagePaths.clear();
+	bool inTag = false;
+	static char tagName[16] = {0};
+	uint8_t tagLen = 0;
+	static char tagAttrs[256] = {0};
+	uint8_t attrsLen = 0;
+	bool collectingTagName = false;
+
+	for (size_t i = 0; i < markup.length(); ++i)
+	{
+		const char ch = markup[i];
+
+		if (!inTag && ch == '<')
+		{
+			inTag = true;
+			tagLen = 0;
+			attrsLen = 0;
+			tagAttrs[0] = '\0';
+			collectingTagName = true;
+			continue;
+		}
+
+		if (inTag)
+		{
+			if (ch == '>')
+			{
+				inTag = false;
+				if (tagLen > 0 && strcmp(tagName, "img") == 0)
+				{
+					// Extract src attribute
+					const char* srcAttr = strstr(tagAttrs, "src=");
+					if (srcAttr)
+					{
+						srcAttr += 4;
+						while (*srcAttr && (*srcAttr == ' ' || *srcAttr == '"' || *srcAttr == '\''))
+						{
+							srcAttr++;
+						}
+						const char* srcEnd = srcAttr;
+						while (*srcEnd && *srcEnd != '"' && *srcEnd != '\'' && *srcEnd != ' ')
+						{
+							srcEnd++;
+						}
+						if (srcEnd > srcAttr)
+						{
+							String imageSrc(srcAttr, srcEnd - srcAttr);
+							imagePaths.push_back(imageSrc);
+						}
+					}
+				}
+				continue;
+			}
+
+			if (collectingTagName)
+			{
+				if (ch == ' ' || ch == '\t' || ch == '\r' || ch == '\n' || ch == '>')
+				{
+					collectingTagName = false;
+					if (ch == '>')
+					{
+						inTag = false;
+					}
+					continue;
+				}
+
+				if (tagLen < sizeof(tagName) - 1)
+				{
+					tagName[tagLen++] = ch;
+					tagName[tagLen] = '\0';
+				}
+			}
+			else
+			{
+				if (attrsLen < sizeof(tagAttrs) - 1)
+				{
+					tagAttrs[attrsLen++] = ch;
+					tagAttrs[attrsLen] = '\0';
+				}
+			}
+		}
+	}
+}
+
+// Get or cache an image from the EPUB
+ImageCacheEntry* getOrCacheImage(const String& imagePath)
+{
+	// Check if already cached
+	for (auto& entry : readerImageCache)
+	{
+		if (entry.srcPath == imagePath)
+		{
+			return &entry;
+		}
+	}
+
+	// Add to cache if there's room
+	if (readerImageCache.size() < kMaxImageCacheSize)
+	{
+		ImageCacheEntry newEntry;
+		newEntry.srcPath = imagePath;
+		readerImageCache.push_back(newEntry);
+		return &readerImageCache.back();
+	}
+
+	// Cache is full, return nullptr (should show placeholder)
+	return nullptr;
+}
+
+// Clear image cache for current chapter
+void clearImageCache()
+{
+	for (auto& entry : readerImageCache)
+	{
+		if (entry.bitmap)
+		{
+			free(entry.bitmap);
+			entry.bitmap = nullptr;
+		}
+	}
+	readerImageCache.clear();
+}
+
 String markupToText(const String& markup)
 {
 	String output;
@@ -2814,6 +2964,14 @@ String markupToText(const String& markup)
 					const bool attrBold = strstr(tagAttrs, "bold") || strstr(tagAttrs, "font-weight:700") || strstr(tagAttrs, "font-weight:800") || strstr(tagAttrs, "font-weight:900");
 					const bool isBreakTag = strcmp(normalizedTag, "br") == 0 || strcmp(normalizedTag, "p") == 0 || strcmp(normalizedTag, "div") == 0 || strcmp(normalizedTag, "section") == 0 || strcmp(normalizedTag, "article") == 0 || strcmp(normalizedTag, "li") == 0;
 					const bool isHeaderTag = strcmp(normalizedTag, "h1") == 0 || strcmp(normalizedTag, "h2") == 0 || strcmp(normalizedTag, "h3") == 0 || strcmp(normalizedTag, "h4") == 0 || strcmp(normalizedTag, "h5") == 0 || strcmp(normalizedTag, "h6") == 0;
+					const bool isImgTag = strcmp(normalizedTag, "img") == 0;
+
+					if (!isCloseTag && isImgTag)
+					{
+						// Add image placeholder
+						output += "[Image]";
+						lastWasSpace = false;
+					}
 
 					if (!isCloseTag && (strcmp(normalizedTag, "strong") == 0 || strcmp(normalizedTag, "b") == 0))
 					{
@@ -2865,7 +3023,7 @@ String markupToText(const String& markup)
 						--headerDepth;
 					}
 
-					if (isBreakTag || isHeaderTag)
+					if (isBreakTag || isHeaderTag || isImgTag)
 					{
 						if (!output.isEmpty() && output[output.length() - 1] != '\n')
 						{
@@ -2997,13 +3155,28 @@ String markupToText(const String& markup)
 
 void* epubOpenCallback(const char* filename, int32_t* size)
 {
+	Serial.print("epubOpenCallback requested: ");
+	Serial.println(filename);
+
+	bool exists = SD.exists(filename);
+	Serial.print("SD.exists(");
+	Serial.print(filename);
+	Serial.print(") = ");
+	Serial.println(exists ? "true" : "false");
+
 	epubFsFile = SD.open(filename, "r");
 	if (!epubFsFile)
 	{
+		Serial.print("epubOpenCallback: SD.open failed for: ");
+		Serial.println(filename);
 		return nullptr;
 	}
 
 	*size = static_cast<int32_t>(epubFsFile.size());
+	Serial.print("epubOpenCallback: opened ");
+	Serial.print(filename);
+	Serial.print(" size=");
+	Serial.println(*size);
 	return &epubFsFile;
 }
 
@@ -3889,6 +4062,8 @@ bool collectEpubTextFromPath(const String& epubPath, String& bookTitle, String& 
 	if (epubZip->openZIP(epubPath.c_str(), epubOpenCallback, epubCloseCallback, epubReadCallback, epubSeekCallback) != 0)
 	{
 		Serial.println("[EPUB] zip open failed");
+		Serial.print("[EPUB] openZIP error: ");
+		Serial.println(epubZip->getLastError());
 		delete epubZip;
 		epubZip = nullptr;
 		return false;
@@ -4129,15 +4304,60 @@ bool collectEpubChapterPaths(const String& epubPath, String& bookTitle, std::vec
 	epubZip = new (std::nothrow) UNZIP();
 	if (!epubZip)
 	{
+		Serial.println("ERROR: Failed to allocate UNZIP");
 		return false;
 	}
 
 	if (epubZip->openZIP(epubPath.c_str(), epubOpenCallback, epubCloseCallback, epubReadCallback, epubSeekCallback) != 0)
 	{
+		Serial.print("ERROR: Failed to open ZIP: ");
+		Serial.println(epubPath);
+		Serial.print("ERROR: openZIP error: ");
+		Serial.println(epubZip->getLastError());
+
+		// Diagnostic: check for end-of-central-directory signature in the file on SD
+		auto checkZipEocd = [&](const String& path)
+		{
+			File f = SD.open(path.c_str(), FILE_READ);
+			if (!f)
+			{
+				Serial.println("Diagnostic: failed to open file directly for EOCD check");
+				return;
+			}
+			uint32_t sz = static_cast<uint32_t>(f.size());
+			Serial.print("Diagnostic: file size="); Serial.println(sz);
+			const uint32_t tail = sz > 65536 ? 65536 : sz;
+			if (!f.seek(sz - tail, SeekSet))
+			{
+				Serial.println("Diagnostic: seek failed");
+				f.close();
+				return;
+			}
+			std::vector<uint8_t> buf;
+			buf.resize(tail);
+			uint32_t read = f.read(buf.data(), tail);
+			Serial.print("Diagnostic: read bytes="); Serial.println(read);
+			bool found = false;
+			for (int i = static_cast<int>(read) - 4; i >= 0; --i)
+			{
+				if (buf[i] == 0x50 && buf[i+1] == 0x4b && buf[i+2] == 0x05 && buf[i+3] == 0x06)
+				{
+					Serial.print("Diagnostic: found EOCD at offset ");
+					Serial.println((int)(sz - read + i));
+					found = true;
+					break;
+				}
+			}
+			if (!found) Serial.println("Diagnostic: EOCD not found in tail of file");
+			f.close();
+		};
+
+		checkZipEocd(epubPath);
 		delete epubZip;
 		epubZip = nullptr;
 		return false;
 	}
+	Serial.println("DEBUG: openZIP succeeded, now reading container.xml");
 
 	auto cleanupZip = []()
 	{
@@ -4152,23 +4372,33 @@ bool collectEpubChapterPaths(const String& epubPath, String& bookTitle, std::vec
 	String containerXml;
 	if (!readNamedZipEntryToString(*epubZip, "META-INF/container.xml", containerXml))
 	{
+		Serial.println("DEBUG: readNamedZipEntryToString failed for container.xml");
+		Serial.println("ERROR: Failed to read META-INF/container.xml");
 		cleanupZip();
 		return false;
 	}
+	Serial.println("DEBUG: container.xml read successfully");
 
 	const String rootfilePath = parseContainerRootfile(containerXml);
 	if (rootfilePath.isEmpty())
 	{
+		Serial.println("ERROR: Could not parse rootfile path from container.xml");
 		cleanupZip();
 		return false;
 	}
+	Serial.print("DEBUG: rootfilePath = ");
+	Serial.println(rootfilePath);
+	Serial.println("DEBUG: now reading OPF file");
 
 	String opfText;
 	if (!readNamedZipEntryToString(*epubZip, rootfilePath.c_str(), opfText))
 	{
+		Serial.print("ERROR: Failed to read OPF file: ");
+		Serial.println(rootfilePath);
 		cleanupZip();
 		return false;
 	}
+	Serial.println("DEBUG: OPF file read successfully");
 
 	const std::vector<String> stylesheetHrefs = parseOpfStylesheetHrefs(opfText);
 	for (const String& stylesheetHref : stylesheetHrefs)
@@ -4201,6 +4431,9 @@ bool collectEpubChapterPaths(const String& epubPath, String& bookTitle, std::vec
 	}
 
 	std::vector<String> chapterRelativePaths = parseOpfSpineChapters(opfText);
+	Serial.print("DEBUG: Spine chapters: ");
+	Serial.println(chapterRelativePaths.size());
+	Serial.println("DEBUG: entering nav doc processing");
 	const String navDocHref = parseOpfNavDocumentHref(opfText);
 	std::vector<ReaderNavEntry> navEntries;
 	if (navDocHref.length() > 0)
@@ -4296,7 +4529,21 @@ bool collectEpubChapterPaths(const String& epubPath, String& bookTitle, std::vec
 		}
 	}
 
+	Serial.println("DEBUG: about to call cleanupZip");
 	cleanupZip();
+	Serial.println("DEBUG: cleanupZip completed");
+	
+	Serial.print("DEBUG: Found ");
+	Serial.print(chapterPaths.size());
+	Serial.println(" chapters");
+	for (size_t i = 0; i < chapterPaths.size() && i < 5; ++i)
+	{
+		Serial.print("  Chapter ");
+		Serial.print(i);
+		Serial.print(": ");
+		Serial.println(chapterPaths[i]);
+	}
+	
 	return !chapterPaths.empty();
 }
 
@@ -4794,6 +5041,7 @@ bool loadReaderChapter(uint16_t chapterIndex)
 	}
 
 	closeReaderChapterStream();
+	clearImageCache();
 
 	resetReaderPageBuilderState();
 	resetReaderMarkupStreamState();
@@ -5496,12 +5744,49 @@ String buildBookListHtml()
 	html.reserve(4096);
 	html += "<!DOCTYPE html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>";
 	html += "<title>Ebook Reader Upload</title>";
-	html += "<style>body{font-family:system-ui,-apple-system,sans-serif;max-width:800px;margin:2rem auto;padding:0 1rem;line-height:1.5;background:#f7f3ea;color:#1f1f1f}h1{margin-bottom:.25rem}form{padding:1rem;border:1px solid #d4c9b8;border-radius:14px;background:#fffaf2}ul{padding-left:1.25rem}li{margin:.25rem 0}code{background:#eee6d8;padding:.1rem .35rem;border-radius:4px}</style></head><body>";
+	html += "<style>body{font-family:system-ui,-apple-system,sans-serif;max-width:800px;margin:2rem auto;padding:0 1rem;line-height:1.5;background:#f7f3ea;color:#1f1f1f}h1{margin-bottom:.25rem}.panel{padding:1rem;border:1px solid #d4c9b8;border-radius:14px;background:#fffaf2}.row{margin:.75rem 0}.status{font-size:.95rem;color:#555}ul{padding-left:1.25rem}li{margin:.25rem 0}code{background:#eee6d8;padding:.1rem .35rem;border-radius:4px}button{padding:.55rem .9rem;border:1px solid #a99880;border-radius:10px;background:#f0e6d6}</style></head><body>";
 	html += "<h1>Ebook Reader</h1>";
-	html += "<p>Upload books to the device. The Wi-Fi server will shut down after the upload finishes.</p>";
-	html += "<form method='POST' action='/upload' enctype='multipart/form-data'>";
-	html += "<input type='file' name='book' multiple accept='.txt,.epub,.mobi,.pdf,.html,.htm,.fb2,.rtf,.md'>";
-	html += "<button type='submit'>Upload</button></form>";
+	html += "<div class='panel'><div class='row'><input id='bookInput' type='file' multiple accept='.txt,.epub,.mobi,.pdf,.html,.htm,.fb2,.rtf,.md'><button id='uploadBtn' type='button'>Upload</button></div><div id='status' class='status'>Ready.</div></div>";
+	html += R"HTML(<script>
+const input = document.getElementById('bookInput');
+const status = document.getElementById('status');
+const chunkSize = 256 * 1024;
+
+async function uploadFileChunked(file) {
+  for (let offset = 0; offset < file.size; offset += chunkSize) {
+    const end = Math.min(offset + chunkSize, file.size);
+    const chunk = file.slice(offset, end);
+    status.textContent = `Uploading ${file.name}: ${offset}/${file.size} bytes`;
+    const url = `/upload/${encodeURIComponent(file.name)}?offset=${offset}&total=${file.size}`;
+    const resp = await fetch(url, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/octet-stream' },
+      body: chunk
+    });
+    if (!resp.ok) {
+      throw new Error(`chunk ${offset}-${end} failed: ${resp.status} ${resp.statusText}`);
+    }
+  }
+}
+
+document.getElementById('uploadBtn').onclick = async () => {
+  const files = [...input.files];
+  if (!files.length) {
+    status.textContent = 'Select at least one file.';
+    return;
+  }
+  try {
+    for (const file of files) {
+      await uploadFileChunked(file);
+      status.textContent = `Uploaded ${file.name}`;
+    }
+    status.textContent = 'Upload complete.';
+    location.reload();
+  } catch (error) {
+    status.textContent = 'Upload failed: ' + error.message;
+  }
+};
+</script>)HTML";
 	html += "<h2>Books on device</h2><ul>";
 
 	File root = SD.open("/");
@@ -5533,7 +5818,7 @@ uint16_t refreshBookList()
 {
 	bookCount = 0;
 	
-	// Use SD card if mounted, otherwise use LittleFS
+	// Use SD card if mounted
 	if (sdMounted)
 	{
 		File root = SD.open("/");
@@ -6021,55 +6306,286 @@ void handleRoot()
 void handleUploadFinished()
 {
 	const String message = uploadSucceeded
-		? "Upload complete. The Wi-Fi server is shutting down now."
+		? "Upload complete."
 		: "Upload finished without a saved file.";
 	server.send(200, "text/html", buildBookListHtml() + "<p><strong>" + htmlEscape(message) + "</strong></p>");
 	if (uploadSucceeded)
 	{
-		shutdownRequested = true;
 	}
 }
 
-void handleFileUpload()
+void handleUploadCreate()
 {
-	HTTPUpload& upload = server.upload();
+	String uploadName = WebServer::urlDecode(server.pathArg(0));
+	uploadName.trim();
+	if (!uploadName.startsWith("/"))
+	{
+		uploadName = "/" + uploadName;
+	}
 
-	if (upload.status == UPLOAD_FILE_START)
+	// Validate SD state and path
+	if (!sdMounted)
 	{
-		uploadSucceeded = false;
-		uploadPath = sanitizeFilename(upload.filename);
-		if (SD.exists(uploadPath))
+		Serial.println("ERROR: SD card not mounted; rejecting upload");
+		server.send(500, "text/plain", "SD card not mounted");
+		return;
+	}
+	if (uploadName.indexOf("..") >= 0)
+	{
+		Serial.println("ERROR: invalid upload path");
+		server.send(400, "text/plain", "Invalid upload path");
+		return;
+	}
+
+	uploadSucceeded = false;
+	uploadBytesReceived = 0;
+	uploadChunkOffset = static_cast<uint32_t>(server.arg("offset").toInt());
+	uploadExpectedTotal = static_cast<uint32_t>(server.arg("total").toInt());
+	uploadPath = uploadName;
+	uploadWriteError = false;
+	Serial.print("handleUploadCreate: uploadPath = ");
+	Serial.println(uploadPath);
+	Serial.print("handleUploadCreate: offset = ");
+	Serial.print(uploadChunkOffset);
+	Serial.print(", total = ");
+	Serial.println(uploadExpectedTotal);
+
+	if (uploadChunkOffset == 0 && SD.exists(uploadPath))
+	{
+		SD.remove(uploadPath);
+	}
+
+	if (uploadChunkOffset > 0 && !SD.exists(uploadPath))
+	{
+		Serial.println("ERROR: resumable chunk received but file does not exist");
+	}
+
+	// Try to pre-allocate file space when total size is known (helps catch low-space errors early)
+	if (uploadChunkOffset == 0 && uploadExpectedTotal > 0)
+	{
+		File alloc = SD.open(uploadPath, FILE_WRITE);
+		if (!alloc)
+		{
+			Serial.println("ERROR: failed to create file for pre-allocation");
+			server.send(500, "text/plain", "Failed to create upload target on SD");
+			return;
+		}
+
+		bool allocOk = true;
+		// Attempt to seek to final byte and write a zero to reserve space
+		uint32_t finalPos = (uploadExpectedTotal > 0) ? (uploadExpectedTotal - 1) : 0;
+		if (finalPos > 0)
+		{
+			if (!alloc.seek(finalPos))
+			{
+				allocOk = false;
+			}
+			else
+			{
+				if (alloc.write((uint8_t)0) != 1)
+				{
+					allocOk = false;
+				}
+			}
+		}
+		alloc.flush();
+		alloc.close();
+
+		if (!allocOk)
 		{
 			SD.remove(uploadPath);
+			Serial.println("ERROR: failed to pre-allocate file (insufficient space?)");
+			server.send(500, "text/plain", "Insufficient space on SD");
+			return;
 		}
-		uploadFile = SD.open(uploadPath, FILE_WRITE);
 	}
-	else if (upload.status == UPLOAD_FILE_WRITE)
+
+	uploadFile = SD.open(uploadPath, FILE_WRITE);
+	if (!uploadFile)
+	{
+		Serial.println("ERROR: failed to open upload file");
+		server.send(500, "text/plain", "Failed to open upload target on SD");
+		return;
+	}
+
+	if (uploadChunkOffset > 0)
+	{
+		if (!uploadFile.seek(uploadChunkOffset))
+		{
+			Serial.println("ERROR: failed to seek to upload offset");
+		}
+	}
+}
+
+void handleUploadWrite()
+{
+	HTTPRaw& raw = server.raw();
+
+	if (raw.status == RAW_START)
+	{
+		Serial.print("RAW_START: uploadPath='");
+		Serial.print(uploadPath);
+		Serial.print("' offset=");
+		Serial.println(uploadChunkOffset);
+
+		// Ensure SD mounted and file is open. Some clients may not trigger create reliably.
+		if (!sdMounted)
+		{
+			Serial.println("ERROR: SD not mounted at RAW_START");
+			uploadWriteError = true;
+			return;
+		}
+
+		if (!uploadFile)
+		{
+			if (uploadPath.isEmpty())
+			{
+				uploadPath = WebServer::urlDecode(server.pathArg(0));
+				uploadPath.trim();
+				if (!uploadPath.startsWith("/"))
+				{
+					uploadPath = "/" + uploadPath;
+				}
+			}
+
+			Serial.print("RAW_START: opening upload file: ");
+			Serial.println(uploadPath);
+			uploadFile = SD.open(uploadPath, FILE_WRITE);
+			if (!uploadFile)
+			{
+				Serial.println("ERROR: failed to open upload file at RAW_START");
+				uploadWriteError = true;
+				return;
+			}
+
+			if (uploadChunkOffset > 0)
+			{
+				if (!uploadFile.seek(uploadChunkOffset))
+				{
+					Serial.println("ERROR: failed to seek to upload offset at RAW_START");
+					uploadWriteError = true;
+					uploadFile.close();
+					return;
+				}
+			}
+			Serial.println("RAW_START: file opened successfully");
+		}
+	}
+	else if (raw.status == RAW_WRITE)
+	{
+		if (!uploadFile)
+		{
+			uploadWriteError = true;
+			Serial.println("ERROR: uploadFile not open during write");
+		}
+		else
+		{
+			uint8_t* p = raw.buf;
+			size_t remaining = raw.currentSize;
+			const int maxRetries = 3;
+			const size_t flushThreshold = 65536; // flush every 64KB
+			static uint32_t sinceLastFlush = 0;
+			while (remaining > 0)
+			{
+				int written = uploadFile.write(p, remaining);
+				if (written > 0)
+				{
+					uploadBytesReceived += static_cast<uint32_t>(written);
+					p += written;
+					remaining -= static_cast<size_t>(written);
+					sinceLastFlush += static_cast<uint32_t>(written);
+					if (sinceLastFlush >= flushThreshold)
+					{
+						uploadFile.flush();
+						sinceLastFlush = 0;
+					}
+					continue;
+				}
+
+				// Retry on temporary write failures
+				int retry = 0;
+				for (; retry < maxRetries && remaining > 0; ++retry)
+				{
+					delay(5);
+					written = uploadFile.write(p, remaining);
+					if (written > 0)
+					{
+						uploadBytesReceived += static_cast<uint32_t>(written);
+						p += written;
+						remaining -= static_cast<size_t>(written);
+						break;
+					}
+				}
+
+				if (remaining > 0 && (written <= 0))
+				{
+					uploadWriteError = true;
+					Serial.print("ERROR: failed to write upload chunk after retries, remaining=");
+					Serial.println(remaining);
+					break;
+				}
+			}
+		}
+	}
+	else if (raw.status == RAW_END)
 	{
 		if (uploadFile)
 		{
-			uploadFile.write(upload.buf, upload.currentSize);
-		}
-	}
-	else if (upload.status == UPLOAD_FILE_END)
-	{
-		if (uploadFile)
-		{
+			uploadFile.flush();
 			uploadFile.close();
+		}
+
+		const uint32_t completedBytes = uploadChunkOffset + uploadBytesReceived;
+		Serial.print("Chunk completed: wrote ");
+		Serial.print(uploadBytesReceived);
+		Serial.print(" bytes at offset ");
+		Serial.print(uploadChunkOffset);
+		Serial.print(" (uploaded so far ");
+		Serial.print(completedBytes);
+		Serial.println(" bytes)");
+
+		File verify = SD.open(uploadPath.c_str(), FILE_READ);
+		if (verify)
+		{
+			uint32_t finalSize = verify.size();
+			verify.close();
+			Serial.print("File size on SD now: ");
+			Serial.print(finalSize);
+			Serial.println(" bytes");
+		}
+
+		const bool finalChunk = (uploadExpectedTotal == 0) ? true : (completedBytes >= uploadExpectedTotal);
+		if (uploadWriteError)
+		{
+			uploadSucceeded = false;
+			Serial.println("Upload failed due to write errors");
+			server.send(500, "text/plain", "ERROR");
+			return;
+		}
+
+		if (finalChunk)
+		{
 			uploadSucceeded = true;
+			Serial.print("Upload completed. Final size expected: ");
+			Serial.println(uploadExpectedTotal);
 		}
+
+		server.send(200, "text/plain", finalChunk ? "FINAL" : "CHUNK");
 	}
-	else if (upload.status == UPLOAD_FILE_ABORTED)
+	else if (raw.status == RAW_ABORTED)
 	{
 		if (uploadFile)
 		{
 			uploadFile.close();
 		}
-		if (!uploadPath.isEmpty())
+		if (uploadChunkOffset == 0 && !uploadPath.isEmpty())
 		{
 			SD.remove(uploadPath);
 		}
 		uploadSucceeded = false;
+		Serial.print("Upload aborted after ");
+		Serial.print(uploadBytesReceived);
+		Serial.println(" bytes");
 	}
 }
 
@@ -6079,7 +6595,7 @@ void startWifiServer()
 	WiFi.softAP(kApSsid, kApPassword);
 
 	server.on("/", HTTP_GET, handleRoot);
-	server.on("/upload", HTTP_POST, handleUploadFinished, handleFileUpload);
+	server.on(UriRegex("/upload/(.*)"), HTTP_PUT, handleUploadCreate, handleUploadWrite);
 	server.onNotFound([]()
 	{
 		server.send(404, "text/plain", "Not found");
@@ -6093,7 +6609,7 @@ void startWifiServer()
 	Serial.println(kApSsid);
 	Serial.print("Open: http://");
 	Serial.println(WiFi.softAPIP());
-	Serial.println("After upload, server will stop and return to menu.");
+	Serial.println("Upload server running. Return to main menu to stop the server.");
 
 	showUploadPortalOnDisplay(WiFi.softAPIP());
 }
@@ -6114,6 +6630,11 @@ void stopWifiServer()
 
 void showMainMenu()
 {
+	// If the upload server is running, stop it when returning to the main menu
+	if (wifiServerRunning)
+	{
+		stopWifiServer();
+	}
 	serialMode = ReaderSerialMode::MainMenu;
 	refreshBookList();
 	mainMenuCursor = 0;
@@ -6660,6 +7181,34 @@ void handleSerialInput()
 }
 }
 
+USBMSC usbMSC;
+
+static int32_t on_msc_read_cb(uint32_t lba, uint32_t offset, void* buffer, uint32_t bufsize)
+{
+	uint8_t* buf = static_cast<uint8_t*>(buffer);
+	uint32_t sectorCount = bufsize / 512;
+	for (uint32_t i = 0; i < sectorCount; i++)
+	{
+		if (!SD.readRAW(buf + i * 512, lba + i)) return -1;
+	}
+	return bufsize;
+}
+
+static int32_t on_msc_write_cb(uint32_t lba, uint32_t offset, uint8_t* buffer, uint32_t bufsize)
+{
+	uint32_t sectorCount = bufsize / 512;
+	for (uint32_t i = 0; i < sectorCount; i++)
+	{
+		if (!SD.writeRAW(buffer + i * 512, lba + i)) return -1;
+	}
+	return bufsize;
+}
+
+static bool on_msc_start_stop_cb(uint8_t power_condition, bool start, bool load_eject)
+{
+	return true;
+}
+
 void setup()
 {
 	Serial.begin(115200);
@@ -6677,13 +7226,24 @@ void setup()
 
 	#if defined(ESP32) && defined(USE_HSPI_FOR_EPD)
 	hspi.begin(kSharedSpiSckPin, kSharedSpiMisoPin, kSharedSpiMosiPin, -1);
-	if (SD.begin(kSdCsPin, hspi, 1000000))
+	if (SD.begin(kSdCsPin, hspi, 20000000))
 	#else
-	if (SD.begin(kSdCsPin, SPI, 1000000))
+	if (SD.begin(kSdCsPin, SPI, 20000000))
 	#endif
 	{
 		sdMounted = true;
 		Serial.println("SD card mounted successfully");
+
+		usbMSC.vendorID("ESP32");
+		usbMSC.productID("USB_MSC");
+		usbMSC.productRevision("1.0");
+		usbMSC.onRead(on_msc_read_cb);
+		usbMSC.onWrite(on_msc_write_cb);
+		usbMSC.onStartStop(on_msc_start_stop_cb);
+		usbMSC.mediaPresent(true);
+		usbMSC.begin(SD.numSectors(), SD.sectorSize());
+		USB.begin();
+
 		refreshBookList();
 	}
 	else
