@@ -50,7 +50,6 @@
 
 #include <GxEPD2_BW.h>
 #include <tinyxml2.h>
-#include <LittleFS.h>
 #include <JPEGDEC.h>
 
 #ifdef INTELSHORT
@@ -181,6 +180,10 @@ constexpr uint8_t kDisplayBusyPin = 4;
 constexpr uint8_t kDisplayResetPin = 38;
 constexpr uint8_t kDisplayDcPin = 10;
 constexpr uint8_t kDisplayCsPin = 44;
+constexpr uint8_t kSharedSpiSckPin = 7;
+constexpr uint8_t kSharedSpiMisoPin = 8;
+constexpr uint8_t kSharedSpiMosiPin = 9;
+constexpr uint8_t kSdCsPin = 5;
 constexpr uint32_t kButtonLongPressMs = 500;
 
 struct ButtonPressTracker
@@ -320,7 +323,7 @@ struct ReaderCoverDrawContext
 
 static void* openLittleFSFileForPng(const char* filename, int32_t* fileSize)
 {
-	File* file = new (std::nothrow) File(LittleFS.open(filename, FILE_READ));
+	File* file = new (std::nothrow) File(SD.open(filename, FILE_READ));
 	if (!file || !(*file))
 	{
 		delete file;
@@ -375,7 +378,7 @@ static int32_t seekLittleFSFileForPng(PNGFILE* pFile, int32_t position)
 
 static void* openLittleFSFileForJpeg(const char* filename, int32_t* fileSize)
 {
-	File* file = new (std::nothrow) File(LittleFS.open(filename, FILE_READ));
+	File* file = new (std::nothrow) File(SD.open(filename, FILE_READ));
 	if (!file || !(*file))
 	{
 		delete file;
@@ -528,8 +531,8 @@ bool extractNamedZipEntryToFile(UNZIP& zip, const char* entryName, const char* o
 		return false;
 	}
 
-	LittleFS.remove(outputPath);
-	File outputFile = LittleFS.open(outputPath, FILE_WRITE);
+	SD.remove(outputPath);
+	File outputFile = SD.open(outputPath, FILE_WRITE);
 	if (!outputFile)
 	{
 		Serial.print("[COVER] failed to open temp file: ");
@@ -541,7 +544,7 @@ bool extractNamedZipEntryToFile(UNZIP& zip, const char* entryName, const char* o
 	{
 		Serial.println("[COVER] openCurrentFile failed");
 		outputFile.close();
-		LittleFS.remove(outputPath);
+		SD.remove(outputPath);
 		return false;
 	}
 
@@ -556,7 +559,7 @@ bool extractNamedZipEntryToFile(UNZIP& zip, const char* entryName, const char* o
 			Serial.println("[COVER] cover exceeds max buffer size");
 			zip.closeCurrentFile();
 			outputFile.close();
-			LittleFS.remove(outputPath);
+			SD.remove(outputPath);
 			return false;
 		}
 
@@ -566,7 +569,7 @@ bool extractNamedZipEntryToFile(UNZIP& zip, const char* entryName, const char* o
 			Serial.println("[COVER] temp file write failed");
 			zip.closeCurrentFile();
 			outputFile.close();
-			LittleFS.remove(outputPath);
+			SD.remove(outputPath);
 			return false;
 		}
 
@@ -1438,7 +1441,7 @@ uint32_t computeReaderIndexSignature(const String& normalizedPath, const std::ve
 	uint32_t hash = 2166136261UL;
 	hash = fnv1aUpdateString(hash, normalizedPath);
 
-	File f = LittleFS.open(normalizedPath, "r");
+	File f = SD.open(normalizedPath, "r");
 	const uint32_t size = f ? static_cast<uint32_t>(f.size()) : 0;
 	if (f)
 	{
@@ -2994,7 +2997,7 @@ String markupToText(const String& markup)
 
 void* epubOpenCallback(const char* filename, int32_t* size)
 {
-	epubFsFile = LittleFS.open(filename, "r");
+	epubFsFile = SD.open(filename, "r");
 	if (!epubFsFile)
 	{
 		return nullptr;
@@ -4735,7 +4738,7 @@ void showReaderCoverOnDisplay()
 					coverDecoded = drawCoverImageOnDisplay(kReaderCoverTempPath, readerCoverPath);
 				}
 				while (display.nextPage());
-				LittleFS.remove(kReaderCoverTempPath);
+				SD.remove(kReaderCoverTempPath);
 			}
 			else
 			{
@@ -4752,7 +4755,7 @@ void showReaderCoverOnDisplay()
 		{
 			delete coverZip;
 		}
-		LittleFS.remove(kReaderCoverTempPath);
+		SD.remove(kReaderCoverTempPath);
 	}
 
 	if (!coverDecoded)
@@ -5501,7 +5504,7 @@ String buildBookListHtml()
 	html += "<button type='submit'>Upload</button></form>";
 	html += "<h2>Books on device</h2><ul>";
 
-	File root = LittleFS.open("/");
+	File root = SD.open("/");
 	File file = root.openNextFile();
 	if (!file)
 	{
@@ -5554,7 +5557,7 @@ uint16_t refreshBookList()
 	}
 	else
 	{
-		File root = LittleFS.open("/");
+		File root = SD.open("/");
 		if (!root)
 		{
 			return 0;
@@ -5885,7 +5888,7 @@ void showUploadPortalOnDisplay(const IPAddress& ipAddress)
 		display.println();
 		display.println("Existing books:");
 
-		File root = LittleFS.open("/");
+		File root = SD.open("/");
 		File file = root.openNextFile();
 		uint16_t count = 0;
 		const uint16_t maxCharacters = uiCharsPerLine(display.width() - 20);
@@ -6035,11 +6038,11 @@ void handleFileUpload()
 	{
 		uploadSucceeded = false;
 		uploadPath = sanitizeFilename(upload.filename);
-		if (LittleFS.exists(uploadPath))
+		if (SD.exists(uploadPath))
 		{
-			LittleFS.remove(uploadPath);
+			SD.remove(uploadPath);
 		}
-		uploadFile = LittleFS.open(uploadPath, FILE_WRITE);
+		uploadFile = SD.open(uploadPath, FILE_WRITE);
 	}
 	else if (upload.status == UPLOAD_FILE_WRITE)
 	{
@@ -6064,7 +6067,7 @@ void handleFileUpload()
 		}
 		if (!uploadPath.isEmpty())
 		{
-			LittleFS.remove(uploadPath);
+			SD.remove(uploadPath);
 		}
 		uploadSucceeded = false;
 	}
@@ -6238,7 +6241,7 @@ void handleDeleteSelection(uint16_t choice)
 	{
 		const String selectedBook = bookNames[choice - 2];
 		const String deletePath = selectedBook.startsWith("/") ? selectedBook : "/" + selectedBook;
-		if (LittleFS.remove(deletePath.c_str()))
+		if (SD.remove(deletePath.c_str()))
 		{
 			Serial.print("Deleted: ");
 			Serial.println(deletePath);
@@ -6672,15 +6675,12 @@ void setup()
 	pinMode(kButtonPin32, INPUT_PULLUP);
 	pinMode(kButtonPin33, INPUT_PULLUP);
 
-	if (!LittleFS.begin(true))
-	{
-		Serial.println("LittleFS mount failed");
-	}
-
-	// Initialize SD card with custom SPI pins
-	// CS=GPIO39, MOSI=GPIO11, MISO=GPIO12, CLK=GPIO13
-	SPI.begin(13, 12, 11, -1);
-	if (SD.begin(39, SPI, 1000000))
+	#if defined(ESP32) && defined(USE_HSPI_FOR_EPD)
+	hspi.begin(kSharedSpiSckPin, kSharedSpiMisoPin, kSharedSpiMosiPin, -1);
+	if (SD.begin(kSdCsPin, hspi, 1000000))
+	#else
+	if (SD.begin(kSdCsPin, SPI, 1000000))
+	#endif
 	{
 		sdMounted = true;
 		Serial.println("SD card mounted successfully");
@@ -6696,7 +6696,6 @@ void setup()
 	loadReaderBookmarks();
 
 	#if defined(ESP32) && defined(USE_HSPI_FOR_EPD)
-	hspi.begin(7, 8, 9, 44);
 	display.epd2.selectSPI(hspi, SPISettings(4000000, MSBFIRST, SPI_MODE0));
 	#endif
 
